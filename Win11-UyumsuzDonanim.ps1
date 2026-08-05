@@ -44,6 +44,11 @@
     bagli ISO'nun surucu harfi (orn: F:). ISO yolunu verirseniz baglanir, isi
     bitince cikarilir. Icerideki sources\setupprep.exe /product server calisir.
 
+.PARAMETER Sessiz
+    -SetupBaslat ile birlikte: hicbir soru sormadan yukseltir. Dosyalar ve
+    kurulu programlar KORUNUR (/auto upgrade). Makine kendiliginden yeniden
+    baslatilmaz. Toplu/uzaktan (NinjaOne) kullanim icin.
+
 .PARAMETER UsbHazirla
     Kurulum USB'sinin surucu harfi (orn: E:). Koke autounattend.xml yazar.
 
@@ -73,6 +78,7 @@
 param(
     [switch]$YerindeYukseltme,
     [string]$SetupBaslat,
+    [switch]$Sessiz,
     [string]$UsbHazirla,
     [switch]$WinPE,
     [switch]$DryRun
@@ -136,6 +142,17 @@ public static extern bool IsProcessorFeaturePresent(uint feature);
 function Get-DonanimDurumu {
     $d = [ordered]@{}
 
+    # --- Kurulu Windows surumu (hangi build'den hangi build'e cikiyoruz) ---
+    $d.OsAd = 'bilinmiyor'; $d.OsSurum = '?'; $d.OsBuild = '?'
+    try {
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        $d.OsAd    = $cv.ProductName
+        $d.OsSurum = if ($cv.DisplayVersion) { $cv.DisplayVersion } else { $cv.ReleaseId }
+        $d.OsBuild = "$($cv.CurrentBuild).$($cv.UBR)"
+        # Win11 22000+ build'dir; ProductName bazi makinelerde hala "Windows 10" der
+        if ([int]$cv.CurrentBuild -ge 22000 -and $d.OsAd -notmatch '11') { $d.OsAd = $d.OsAd -replace '10','11' }
+    } catch {}
+
     # --- Islemci ---
     $cpu = $null
     try { $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 } catch {}
@@ -186,6 +203,7 @@ function Goster-Rapor {
     Baslik "Donanim uyumluluk raporu"
     Write-Host ("  Islemci : {0}" -f $d.CpuAd)
     Write-Host ("  Bellek  : {0} GB   Sistem diski: {1} GB" -f $d.RamGB, $d.DiskGB)
+    Write-Host ("  Windows : {0} (surum {1}, build {2})" -f $d.OsAd, $d.OsSurum, $d.OsBuild)
     Write-Host ""
 
     $satirlar = @()
@@ -265,11 +283,26 @@ function Set-HwReqChk {
     (Neowin rehberindeki "Option 1" budur.)
 #>
 function Start-SetupPrep {
-    param([Parameter(Mandatory)][string]$Kaynak)
+    param(
+        [Parameter(Mandatory)][string]$Kaynak,
+        [switch]$Sessiz          # hic soru sormadan, dosyalar+programlar korunarak yukselt
+    )
 
     $harf = $null
     $baglandi = $false
     try {
+        # Klasor/surucu verildiyse: once "bu zaten kurulum medyasi mi?" diye bak
+        # (bagli ISO ya da USB -> sources\setupprep.exe icerir). Degilse, icinde
+        # ISO ariyoruz. Sira onemli: F: gibi bagli bir medyada ISO aramak yanlis
+        # olurdu.
+        if ((Test-Path -LiteralPath $Kaynak -PathType Container -ErrorAction SilentlyContinue) -and
+            -not (Test-Path -LiteralPath ("$($Kaynak.TrimEnd('\'))\sources\setupprep.exe") -ErrorAction SilentlyContinue)) {
+            $bulunan = Get-ChildItem -LiteralPath $Kaynak -Filter '*.iso' -ErrorAction SilentlyContinue |
+                       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($bulunan) { Yaz "Klasorde ISO bulundu: $($bulunan.Name)" 'OK'; $Kaynak = $bulunan.FullName }
+            else { Yaz "Bu klasorde ne kurulum medyasi ne de ISO var: $Kaynak" 'ERR'; return }
+        }
+
         if ($Kaynak -match '\.iso$') {
             if (-not (Test-Path $Kaynak)) { Yaz "ISO bulunamadi: $Kaynak" 'ERR'; return }
             if ($DryRun) { Yaz "[DRY] ISO baglanip setupprep.exe /product server calistirilacak" 'SKIP'; return }
@@ -280,8 +313,10 @@ function Start-SetupPrep {
             $baglandi = $true
             Yaz "ISO baglandi: $harf" 'OK'
         } else {
+            # Yalniz tek harf verildiyse iki nokta eklenir ("F" -> "F:").
+            # "F:", "C:\medya" ve "\\sunucu\pay" oldugu gibi birakilir.
             $harf = $Kaynak.TrimEnd('\')
-            if ($harf -notmatch ':') { $harf = "$harf`:" }
+            if ($harf -match '^[A-Za-z]$') { $harf = "$harf`:" }
         }
 
         # Join-Path kullanilmaz: olmayan bir surucu harfi verilirse ("Cannot find
@@ -294,13 +329,42 @@ function Start-SetupPrep {
             Yaz "dogrudan ISO dosyasinin yolunu verin (orn: -SetupBaslat C:\Win11.iso)" 'INFO'
             return
         }
-        if ($DryRun) { Yaz "[DRY] Calistirilacak: $prep /product server" 'SKIP'; return }
+        # Sessiz mod: hicbir soru sorulmadan yukseltir.
+        #   /auto upgrade  -> dosyalar VE programlar korunur (temiz kurulum degil)
+        #   /quiet         -> arayuz yok
+        #   /noreboot      -> makineyi biz kapatmayiz, zamanlamasi sizde kalir
+        #   /compat ignorewarning -> "su program uyumsuz olabilir" uyarilarinda durmaz
+        #   /dynamicupdate disable -> kurulum sirasinda WU'dan ek paket cekmez;
+        #                             cekseydi denetim bilesenleri tazelenip
+        #                             atlatmayi bozabilirdi (ve cok uzardi)
+        $argumanlar = @('/product','server')
+        if ($Sessiz) {
+            $argumanlar += @('/auto','upgrade','/quiet','/eula','accept','/noreboot',
+                             '/compat','ignorewarning','/dynamicupdate','disable')
+        }
 
-        Yaz "Calistiriliyor: setupprep.exe /product server" 'OK'
+        if ($DryRun) { Yaz "[DRY] Calistirilacak: $prep $($argumanlar -join ' ')" 'SKIP'; return }
+
+        Yaz "Calistiriliyor: setupprep.exe $($argumanlar -join ' ')" 'OK'
         Yaz "Ekranda 'Windows Server' yazacak - normaldir, mevcut surumunuz kurulur." 'INFO'
-        # Setup ayri pencerede acilir; ISO'yu erken cikarmamak icin BEKLENIR.
-        Start-Process -FilePath $prep -ArgumentList '/product','server' -Wait
-        Yaz "Kurulum penceresi kapandi" 'INFO'
+        if ($Sessiz) {
+            Yaz "SESSIZ YUKSELTME: 30-60 dk surer, ekranda bir sey gorunmez." 'WARN'
+            Yaz "Bitince makine kendiliginden yeniden BASLATILMAZ; siz baslatacaksiniz." 'WARN'
+        }
+        # Setup ayri surectir; ISO'yu erken cikarmamak icin BEKLENIR.
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $p = Start-Process -FilePath $prep -ArgumentList $argumanlar -Wait -PassThru
+        $sw.Stop()
+
+        # setup.exe cikis kodlari: 0 = tamam, 0x3010 (12304) = yeniden baslatma gerekli
+        switch ($p.ExitCode) {
+            0     { Yaz ("Yukseltme tamamlandi ({0:N0} dk)" -f $sw.Elapsed.TotalMinutes) 'OK' }
+            12304 { Yaz ("Yukseltme tamamlandi, YENIDEN BASLATMA gerekiyor ({0:N0} dk)" -f $sw.Elapsed.TotalMinutes) 'OK' }
+            default {
+                Yaz ("Kurulum {0} kodu ile bitti ({1:N0} dk)" -f $p.ExitCode, $sw.Elapsed.TotalMinutes) 'WARN'
+                Yaz "Ayrinti: C:\`$WINDOWS.~BT\Sources\Panther\setupact.log" 'INFO'
+            }
+        }
     }
     catch { Yaz "setupprep baslatilamadi: $($_.Exception.Message)" 'ERR' }
     finally {
@@ -449,8 +513,11 @@ if ($SetupBaslat) {
         Yaz "Once denetim anahtarlari da yaziliyor (garanti olsun)" 'INFO'
         Set-MoSetup; Set-HwReqChk
     }
-    Start-SetupPrep -Kaynak $SetupBaslat
+    Start-SetupPrep -Kaynak $SetupBaslat -Sessiz:$Sessiz
     $islemYapildi = $true
+}
+elseif ($Sessiz) {
+    Yaz "-Sessiz tek basina bir sey yapmaz; -SetupBaslat <ISO> ile birlikte kullanin." 'WARN'
 }
 
 if ($WinPE -or ($script:PEdeyiz -and -not $YerindeYukseltme -and -not $UsbHazirla)) {
@@ -488,10 +555,18 @@ if ($UsbHazirla) {
 
 if (-not $islemYapildi) {
     Baslik "Ne yapmali?"
+    Write-Host "  ONEMLI: Uyumsuz makineye Windows Update ASLA yeni build (24H2/25H2)" -ForegroundColor Yellow
+    Write-Host "  teklif etmez - sadece aylik guncellemeler gelir. Yeni build icin ISO sart:" -ForegroundColor Yellow
+    Write-Host "  microsoft.com/software-download/windows11 > 'Disk Image (ISO)'" -ForegroundColor Gray
+    Write-Host ""
     Write-Host "  1) Mevcut Windows'u yukseltmek (dosyalar/programlar kalsin) - EN KOLAY:" -ForegroundColor White
     Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso" -ForegroundColor Gray
     Write-Host "       anahtarlari yazar + setupprep.exe /product server ile kurulumu baslatir" -ForegroundColor DarkGray
     Write-Host "       (sadece anahtar yazip elle kurmak icin -SetupBaslat vermeyin)" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  1b) Toplu / uzaktan, hic soru sormadan (NinjaOne vb.):" -ForegroundColor White
+    Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat \\sunucu\pay\Win11.iso -Sessiz" -ForegroundColor Gray
+    Write-Host "       30-60 dk surer, ekranda bir sey gorunmez, makineyi kendisi baslatmaz" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  2) Sifirdan kurulum (USB ile):" -ForegroundColor White
     Write-Host "       .\Win11-UyumsuzDonanim.ps1 -UsbHazirla E:" -ForegroundColor Gray

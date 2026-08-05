@@ -4,6 +4,13 @@
     tani + atlatma (bypass) yardimcisi.
 
 .DESCRIPTION
+    PARAMETRESIZ CALISTIRIN: hicbir sey ezberlemeye gerek yok. Script makineyi
+    inceler, durumu tek cumleyle ozetler ve o duruma uygun secenegi "onerilen"
+    olarak isaretleyip sorar (Enter = onerilen). Makine zaten guncelse
+    "yapacak bir sey yok" der; hazir ISO varsa yeniden indirmeyi teklif etmez.
+    Parametre verildiginde ya da etkilesimsiz oturumda menu ACILMAZ - otomasyon
+    (NinjaOne/GPO) bundan etkilenmez.
+
     Once makinenin HANGI gereksinimden kaldigini tespit eder, sonra o duruma
     uyan atlatma yontemini uygular:
 
@@ -74,7 +81,7 @@
     Hicbir sey yazmaz, sadece ne yapacagini soyler.
 
 .EXAMPLE
-    .\Win11-UyumsuzDonanim.ps1                      # sadece rapor
+    .\Win11-UyumsuzDonanim.ps1                      # ONERILEN: rapor + "ne yapalim?" menusu
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme    # anahtarlari yaz, kurulumu elle baslat
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir           # C:\Temp'e indirip kurar
@@ -654,6 +661,86 @@ else {
         if ($sbKapaliAma) { Yaz "UEFI var, Secure Boot kapali -> BIOS > Boot > Secure Boot = Enabled (CSM/Legacy kapatilir)" 'WARN' }
         Yaz "Bunlari acinca makine cogu zaman DESTEKLENEN duruma gecer; guvenlik de korunur." 'INFO'
         Write-Host ""
+    }
+}
+
+# --- Hicbir parametre verilmediyse: duruma bakip KENDISI karar verir ---
+# Amac: kullanicinin komut ezberlemesi gerekmesin. Script cift tiklanip
+# calistirildiginda ne yapilmasi gerektigini soyler, onerilenle birlikte kisa
+# bir menu sunar. Otomasyonda (parametreli ya da etkilesimsiz) bu menu ACILMAZ.
+$hicSecimYok  = -not ($YerindeYukseltme -or $SetupBaslat -or $UsbHazirla -or $WinPE -or $IsoIndir)
+$etkilesimli  = [Environment]::UserInteractive -and -not $script:PEdeyiz
+
+if ($hicSecimYok -and $etkilesimli -and -not $DryRun) {
+
+    # Durum 1: makine hangi build'de? 26100 = 24H2, uzeri 25H2 ve sonrasi.
+    $buildNo = 0
+    [void][int]::TryParse((("$($donanim.OsBuild)" -split '\.')[0]), [ref]$buildNo)
+    $zatenGuncel = ($buildNo -ge 26100)
+
+    # Durum 2: elimizde hazir ISO var mi? (bosuna 6 GB indirmeyelim)
+    $hazirIso = $null
+    try {
+        $hazirIso = Get-ChildItem -LiteralPath $IsoKlasor -Filter '*.iso' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Length -gt 3GB } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    } catch {}
+
+    Baslik "Ne yapalim?"
+
+    # Once durumu tek cumleyle ozetle, sonra sec dedirt.
+    if ($zatenGuncel) {
+        Yaz "Bu makine zaten build $buildNo (24H2 veya sonrasi) - yukseltmeye gerek yok." 'OK'
+    } elseif ($eksikler.Count -eq 0) {
+        Yaz "Makine tum sartlari sagliyor: normal yoldan da yukseltilebilir." 'OK'
+    } else {
+        Yaz "Makine denetimden kaliyor -> yukseltmek icin atlatma gerekiyor." 'WARN'
+    }
+    if ($hazirIso) { Yaz "Hazir ISO bulundu: $($hazirIso.Name) - yeniden indirilmeyecek." 'OK' }
+
+    # Onerilen secenek duruma gore degisir
+    $oneri = if ($zatenGuncel) { '4' } else { '1' }
+
+    Write-Host ""
+    $etiket1 = if ($hazirIso) { "Simdi yukselt (mevcut ISO ile)" } else { "ISO'yu indir ve simdi yukselt (~5-6 GB)" }
+    Write-Host ("   [1] {0}{1}" -f $etiket1, $(if ($oneri -eq '1') { '   <- onerilen' })) -ForegroundColor $(if ($oneri -eq '1') { 'Green' } else { 'White' })
+    Write-Host  "   [2] Sadece denetim anahtarlarini yaz (kurulumu kendim baslatacagim)" -ForegroundColor White
+    Write-Host  "   [3] Kurulum USB'si hazirla (sifirdan kurulum icin)" -ForegroundColor White
+    Write-Host ("   [4] Hicbir sey yapma, cik{0}" -f $(if ($oneri -eq '4') { '   <- onerilen' })) -ForegroundColor $(if ($oneri -eq '4') { 'Green' } else { 'White' })
+    Write-Host ""
+
+    $secim = Read-Host "  Seciminiz (Enter = $oneri)"
+    if ([string]::IsNullOrWhiteSpace($secim)) { $secim = $oneri }
+
+    switch ($secim.Trim()) {
+        '1' {
+            Write-Host ""
+            if ($hazirIso) { Yaz "Yapilacak: anahtarlar yazilir + $($hazirIso.Name) ile yukseltme baslar." 'INFO' }
+            else           { Yaz "Yapilacak: ISO indirilir ($IsoKlasor), anahtarlar yazilir, yukseltme baslar." 'INFO' }
+            Yaz "Dosyalariniz ve programlariniz KORUNUR. Islem 1-2 saat surebilir." 'INFO'
+            $onay = Read-Host "  Devam edilsin mi? (E/h)"
+            if ($onay -match '^(h|n)') { Yaz "Vazgecildi." 'INFO' }
+            else {
+                $YerindeYukseltme = $true
+                if ($hazirIso) { $SetupBaslat = $hazirIso.FullName } else { $IsoIndir = $true }
+            }
+        }
+        '2' { $YerindeYukseltme = $true }
+        '3' {
+            # Takili cikarilabilir suruculeri listele ki harf tahmin edilmesin
+            $usbler = @()
+            try { $usbler = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=2' -ErrorAction Stop) } catch {}
+            if ($usbler.Count -gt 0) {
+                Write-Host ""
+                Yaz "Takili cikarilabilir suruculer:" 'INFO'
+                foreach ($u in $usbler) {
+                    Write-Host ("     {0}  {1}  {2} GB" -f $u.DeviceID, $u.VolumeName, [math]::Round($u.Size/1GB,1))
+                }
+            } else { Yaz "Cikarilabilir surucu gorunmuyor (USB takili mi?)" 'WARN' }
+            $harf = Read-Host "  USB surucu harfi (orn: E)"
+            if ([string]::IsNullOrWhiteSpace($harf)) { Yaz "Harf verilmedi, vazgecildi." 'WARN' }
+            else { $UsbHazirla = $harf.Trim() }
+        }
+        default { Yaz "Islem yapilmadi." 'INFO' }
     }
 }
 

@@ -4,8 +4,15 @@
 
 .DESCRIPTION
     Yeni kurulan bir Windows 11 makinede elle yapilan ayarlari otomatiklestirir:
-    taskbar/explorer duzeni, gereksiz UWP uygulamalarinin kaldirilmasi,
-    gizlilik/telemetri ayarlari, sistem tweak'leri ve winget ile uygulama kurulumu.
+    taskbar/explorer duzeni, masaustu ikonlari, gereksiz UWP uygulamalarinin
+    kaldirilmasi, gizlilik/telemetri ayarlari, ofis odakli performans ayarlari,
+    donanim sagligi raporu (batarya + disk), Windows/surucu guncellemesi, uretici
+    surucu araci ve winget ile uygulama kurulumu (Chrome resmi MSI ile en son surum).
+
+    Performans ayarlari OFIS bilgisayari icin secildi: gorsel efekt/animasyon
+    kapatma, saydamlik kapatma, masaustunde yuksek guc plani (laptopta dokunulmaz),
+    otomatik depo temizleme. Oyun odakli tweak'ler (HAGS, shader cache, frame cap)
+    bilerek DAHIL EDILMEDI -> ofiste getirisi yok, riski var.
 
     Per-user (HKCU) ayarlar hem o an giris yapmis tum kullanicilara hem de
     Default User hive'ina yazilir. Boylece SYSTEM baglaminda (NinjaOne, GPO,
@@ -78,8 +85,18 @@ $Config = @{
     HizliBaslatmaKapat         = $true   # Fast Startup (dual boot / servis icin sorunlu)
     YapiskanTuslarKapat        = $true   # 5 kez Shift uyarisi
     HibernasyonKapat           = $false  # Laptop'ta $false birak
-    GucPlaniYuksekPerformans   = $false  # Sunucu / masaustu icin $true
     SaatDilimiOtomatik         = $true
+
+    # --- Ofis performansi (guvenli, geri alinabilir; oyun tweak'leri BILEREK yok) ---
+    GorselEfektlerPerformans   = $true   # Animasyon/golge kapat -> arayuz aninda acilir (yazi netligi KORUNUR)
+    SaydamlikKapat             = $true   # Transparency efektini kapat (hafif GPU/islemci tasarrufu)
+    OfisGucPlani               = $true   # Masaustunde Yuksek Performans; LAPTOP'ta Dengeli birakilir (pil/isi)
+    DepoTemizlemeOtomatik      = $true   # Storage Sense: gecici dosyalari otomatik temizle
+    SysMainKapat               = $false  # SSD'de disk yukunu azaltabilir; emin degilsen $false birak
+    AramaIndeksiKapat          = $false  # OFISTE ACIK BIRAK -> dosya/e-posta aramasini hizlandirir
+
+    # --- Donanim sagligi ---
+    SaglikRaporu               = $true   # Batarya (laptop) + disk sagligi raporu + yorum
 
     # --- Temizlik ---
     BloatwareKaldir            = $true
@@ -87,6 +104,7 @@ $Config = @{
     # --- Guncelleme (kurulum sonunda calisir, uzun surebilir) ---
     WindowsUpdate              = $true   # Eksik Windows guncellemelerini indir + kur
     SuruculeriGuncelle         = $true   # Windows Update uzerinden surucu guncellemeleri
+    OemSurucuAraci             = $true   # Ureticinin resmi surucu aracini kur (Dell/HP/Lenovo/Intel)
 }
 
 # Chrome ayri kuruluyor (asagidaki KurChrome) — winget'in Chrome paketi Google
@@ -254,6 +272,89 @@ function Invoke-ForEachUserHive {
     elseif ($DryRun) { & $Script "Registry::HKEY_USERS\W11Default(DRY)" }
 }
 
+# Cihaz laptop mu? Sasi tipi (ChassisTypes) tasinabilir sinifindaysa ya da
+# batarya varsa laptop kabul edilir.
+function Test-Laptop {
+    try {
+        $laptopSasi = 8,9,10,11,12,14,18,21,30,31,32   # portable/laptop/notebook/tablet
+        $sasi = (Get-CimInstance Win32_SystemEnclosure -ErrorAction Stop).ChassisTypes
+        foreach ($c in $sasi) { if ($laptopSasi -contains [int]$c) { return $true } }
+    } catch {}
+    return [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+}
+
+<#
+    Show-BatteryHealth: powercfg batarya raporundan tasarim kapasitesi ve mevcut
+    tam sarj kapasitesini okuyup saglik yuzdesini yorumlar. Yalniz laptoplarda.
+#>
+function Show-BatteryHealth {
+    $xml = Join-Path $env:TEMP "batt_$PID.xml"
+    try {
+        powercfg.exe /batteryreport /xml /output "$xml" | Out-Null
+        if (-not (Test-Path $xml)) { Write-Log "Batarya raporu olusturulamadi" 'WARN'; return }
+        $icerik = Get-Content $xml -Raw
+
+        # Bir cihazda birden fazla batarya olabilir -> topla
+        $tasarim = ([regex]::Matches($icerik, '<DesignCapacity>(\d+)</DesignCapacity>') | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum).Sum
+        $tam     = ([regex]::Matches($icerik, '<FullChargeCapacity>(\d+)</FullChargeCapacity>') | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum).Sum
+        $dongu   = [regex]::Match($icerik, '<CycleCount>(\d+)</CycleCount>').Groups[1].Value
+
+        if (-not $tasarim -or -not $tam) { Write-Log "Batarya kapasite verisi okunamadi (masaustu/desteklemeyen cihaz olabilir)" 'WARN'; return }
+
+        $saglik = [math]::Round(($tam / $tasarim) * 100)
+        Write-Log ("Batarya tasarim kapasitesi : {0:N0} mWh" -f $tasarim)
+        Write-Log ("Batarya mevcut kapasitesi  : {0:N0} mWh" -f $tam)
+        if ($dongu) { Write-Log "Sarj dongusu               : $dongu" }
+        Write-Log  "Batarya sagligi            : %$saglik"
+
+        if     ($saglik -ge 80) { Write-Log "YORUM: Batarya saglikli (>=%80). Bir sorun yok." 'OK' }
+        elseif ($saglik -ge 60) { Write-Log "YORUM: Batarya normal yaslanmis (%60-80). Takip edin, aciliyet yok." 'INFO' }
+        elseif ($saglik -ge 40) { Write-Log "YORUM: Batarya yipranmis (%40-60). Sarj suresi belirgin kisalmistir." 'WARN' }
+        else                    { Write-Log "YORUM: Batarya kritik (<%40). Degisim dusunulmeli." 'ERR' }
+    }
+    catch { Write-Log "Batarya sagligi okunamadi: $($_.Exception.Message)" 'WARN' }
+    finally { Remove-Item $xml -ErrorAction SilentlyContinue }
+}
+
+<#
+    Show-DiskHealth: fiziksel disklerin SMART saglik durumunu ve (SSD icin)
+    asinma/omur ile sicaklik degerlerini yorumlar.
+#>
+function Show-DiskHealth {
+    try {
+        $diskler = Get-PhysicalDisk -ErrorAction Stop
+    } catch { Write-Log "Disk bilgisi alinamadi: $($_.Exception.Message)" 'WARN'; return }
+
+    foreach ($d in $diskler) {
+        $boyutGB = [math]::Round($d.Size / 1GB)
+        $tur = $d.MediaType   # SSD / HDD / Unspecified
+        Write-Log ("Disk: {0} ({1} GB, {2})" -f $d.FriendlyName, $boyutGB, $tur)
+
+        $durum = "$($d.HealthStatus)"   # Healthy / Warning / Unhealthy
+        switch ($durum) {
+            'Healthy' { Write-Log "  SMART durumu: Healthy" 'OK' }
+            'Warning' { Write-Log "  SMART durumu: Warning -> yedek alin, disk izlenmeli" 'WARN' }
+            default   { Write-Log "  SMART durumu: $durum -> ACIL yedek + degisim" 'ERR' }
+        }
+
+        $rc = $d | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+        if ($rc) {
+            if ($null -ne $rc.Wear) {
+                $kalan = 100 - [int]$rc.Wear
+                $seviye = if ($rc.Wear -lt 20) {'OK'} elseif ($rc.Wear -lt 80) {'INFO'} else {'WARN'}
+                Write-Log ("  SSD omru: ~%{0} kaldi (asinma %{1})" -f $kalan, [int]$rc.Wear) $seviye
+            }
+            if ($rc.Temperature) {
+                $ts = if ($rc.Temperature -lt 55) {'OK'} elseif ($rc.Temperature -lt 70) {'INFO'} else {'WARN'}
+                Write-Log ("  Sicaklik: {0} C" -f [int]$rc.Temperature) $ts
+            }
+            if ($rc.ReadErrorsUncorrected -gt 0 -or $rc.WriteErrorsUncorrected -gt 0) {
+                Write-Log ("  Duzeltilemeyen hata: okuma {0}, yazma {1} -> disk yipraniyor" -f $rc.ReadErrorsUncorrected, $rc.WriteErrorsUncorrected) 'WARN'
+            }
+        }
+    }
+}
+
 #endregion
 
 Write-Baslik "Windows 11 Post-Install"
@@ -262,6 +363,21 @@ Write-Log "Kullanici: $($kimlik.Name)"
 Write-Log "Surum   : $((Get-CimInstance Win32_OperatingSystem).Caption) / Build $([Environment]::OSVersion.Version.Build)"
 Write-Log "Log     : $script:LogFile"
 if ($DryRun) { Write-Log "DRY RUN modu - hicbir degisiklik yapilmayacak" 'WARN' }
+
+# Laptop mu? Guc plani ve batarya raporu buna gore davranir.
+$script:Laptop = Test-Laptop
+Write-Log "Cihaz tipi: $(if ($script:Laptop) {'Laptop / tasinabilir'} else {'Masaustu / sabit'})"
+
+#region ==================== DONANIM SAGLIGI ====================
+
+if ($Config.SaglikRaporu) {
+    Write-Baslik "Donanim sagligi"
+    if ($script:Laptop) { Show-BatteryHealth }
+    else { Write-Log "Masaustu cihaz -> batarya raporu atlandi" 'SKIP' }
+    Show-DiskHealth
+}
+
+#endregion
 
 #region ==================== PER-USER AYARLAR ====================
 
@@ -355,6 +471,20 @@ Invoke-ForEachUserHive {
         Set-Reg "$U\Control Panel\Accessibility\Keyboard Response" 'Flags' '122' 'String'
         Set-Reg "$U\Control Panel\Accessibility\ToggleKeys"    'Flags' '58'  'String'
     }
+
+    # --- Ofis performansi (per-user) ---
+    # Gorsel efektler: "en iyi performans" ama YAZI NETLIGI (ClearType) korunur.
+    # VisualFXSetting=3 (ozel) + animasyon/golge kapatilir; FontSmoothing'e dokunulmaz.
+    if ($Config.GorselEfektlerPerformans) {
+        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" 'VisualFXSetting' 3
+        Set-Reg "$U\Control Panel\Desktop\WindowMetrics" 'MinAnimate' '0' 'String'
+        Set-Reg $Adv 'TaskbarAnimations'    0
+        Set-Reg $Adv 'ListviewAlphaSelect'  0
+        Set-Reg $Adv 'ListviewShadow'       0
+    }
+    if ($Config.SaydamlikKapat) {
+        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'EnableTransparency' 0
+    }
 }
 Write-Log "Per-user ayarlar uygulandi (aktif kullanicilar + Default profil)" 'OK'
 
@@ -411,11 +541,43 @@ if ($Config.HibernasyonKapat -and -not $DryRun) {
     Write-Log "Hibernasyon kapatildi (hiberfil.sys silindi)" 'OK'
 }
 
-if ($Config.GucPlaniYuksekPerformans -and -not $DryRun) {
+if ($Config.OfisGucPlani -and -not $DryRun) {
+    # Laptop'ta Yuksek Performans zorlamak pili ve isiyi kotu etkiler -> Dengeli
+    # birakilir. Masaustunde islemci uyku (core parking) engellenip menu/uygulama
+    # acilislarindaki mikro gecikmeler kaldirilir.
+    if ($script:Laptop) {
+        Write-Log "Laptop -> guc plani Dengeli birakildi (pil/isi icin dogru secim)" 'INFO'
+    } else {
+        try {
+            powercfg.exe /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null  # High performance
+            Write-Log "Guc plani: Yuksek performans (masaustu)" 'OK'
+        } catch { Write-Log "Guc plani degistirilemedi" 'WARN' }
+    }
+}
+
+if ($Config.DepoTemizlemeOtomatik) {
+    # Storage Sense: gecici dosyalari ve geri donusum kutusunu otomatik temizler.
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense' 'AllowStorageSenseGlobal' 1
+    Write-Log "Otomatik depo temizleme (Storage Sense) acildi" 'OK'
+}
+
+if ($Config.SysMainKapat -and -not $DryRun) {
+    # SSD'li sistemlerde SysMain (SuperFetch) bazen gereksiz disk G/C uretir.
+    # Varsayilan $false -> yalniz bilinerek acildiginda calisir.
     try {
-        powercfg.exe /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null  # High performance
-        Write-Log "Guc plani: Yuksek performans" 'OK'
-    } catch { Write-Log "Guc plani degistirilemedi" 'WARN' }
+        Stop-Service SysMain -Force -ErrorAction SilentlyContinue
+        Set-Service  SysMain -StartupType Disabled -ErrorAction Stop
+        Write-Log "SysMain kapatildi (SSD icin)" 'OK'
+    } catch { Write-Log "SysMain kapatilamadi: $($_.Exception.Message)" 'WARN' }
+}
+
+if ($Config.AramaIndeksiKapat -and -not $DryRun) {
+    # DIKKAT ofis: kapatmak dosya/e-posta aramasini yavaslatir. Varsayilan $false.
+    try {
+        Stop-Service WSearch -Force -ErrorAction SilentlyContinue
+        Set-Service  WSearch -StartupType Disabled -ErrorAction Stop
+        Write-Log "Arama indeksleme kapatildi (Windows Search)" 'OK'
+    } catch { Write-Log "WSearch kapatilamadi: $($_.Exception.Message)" 'WARN' }
 }
 
 #endregion
@@ -595,6 +757,61 @@ if (($Config.WindowsUpdate -or $Config.SuruculeriGuncelle) -and -not $DryRun) {
 }
 elseif ($DryRun) {
     Write-Log "[DRY] Windows/surucu guncellemeleri calistirilacak" 'SKIP'
+}
+
+#endregion
+
+#region ==================== OEM SURUCU ARACI ====================
+
+# En son ve DOGRU surucu, ureticinin kendi aracindan gelir (WU her zaman en yeniyi
+# vermez). Makinenin markasi okunur, resmi guncelleme araci winget ile kurulur.
+# Dell'de ayrica komut satiriyla (dcu-cli) suruculer otomatik uygulanabilir.
+if ($Config.OemSurucuAraci -and -not $SkipApps) {
+    Write-Baslik "Uretici surucu araci"
+
+    $marka = ''
+    try { $marka = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer } catch {}
+    Write-Log "Uretici: $marka"
+
+    # Marka -> resmi winget araci. Substring eslesme (ornek: 'Dell Inc.').
+    $arac = switch -Regex ($marka) {
+        'Dell'              { 'Dell.CommandUpdate';   break }
+        'HP|Hewlett'        { 'HP.Support.Assistant'; break }
+        'Lenovo'            { 'Lenovo.SystemUpdate';  break }
+        'Microsoft'         { '';                     break }  # Surface -> WU yeterli
+        default             { '' }
+    }
+
+    $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $arac) {
+        Write-Log "Bu marka icin ozel arac yok; suruculer Windows Update'ten gelir" 'INFO'
+    }
+    elseif (-not $wg) {
+        Write-Log "winget yok, OEM araci kurulamadi: $arac" 'WARN'
+    }
+    elseif ($DryRun) {
+        Write-Log "[DRY] OEM araci kurulacak: $arac" 'SKIP'
+    }
+    else {
+        Write-Log "Kuruluyor: $arac ..."
+        & $wg.Source install --id $arac --exact --silent --accept-package-agreements `
+              --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Log "OEM araci kuruldu: $arac" 'OK' }
+        else { Write-Log "OEM araci kurulamadi (exit $LASTEXITCODE); elle kurulabilir" 'WARN' }
+
+        # Dell: dcu-cli ile suruculeri otomatik tara + uygula (yeniden baslatma yok).
+        if ($marka -match 'Dell') {
+            $dcu = Get-ChildItem "$env:ProgramFiles*\Dell\CommandUpdate\dcu-cli.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+            if ($dcu) {
+                Write-Log "Dell Command Update ile suruculer taraniyor + uygulaniyor..."
+                & $dcu.FullName /applyUpdates -reboot=disable 2>&1 | Out-Null
+                Write-Log "Dell surucu guncellemesi tetiklendi (log: dcu-cli)" 'OK'
+            }
+        } else {
+            Write-Log "NOT: HP/Lenovo araci kuruldu; en son suruculeri cekmek icin aracı bir kez calistirin" 'INFO'
+        }
+    }
 }
 
 #endregion

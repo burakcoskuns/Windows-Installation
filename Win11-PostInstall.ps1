@@ -115,6 +115,7 @@ $Config = @{
 # installer'i ayni URL'de guncelledigi icin sik sik "hash uyusmuyor" hatasi verir.
 # Resmi Enterprise MSI her zaman en son surumu makine geneli kurar.
 $Config_KurChrome = $true
+$Config['ChromeVarsayilanTarayici'] = $true   # Chrome'u varsayilan tarayici yap (yeni profiller)
 
 # winget ile kurulacak uygulamalar (winget id)
 $Apps = @(
@@ -274,6 +275,42 @@ function Invoke-ForEachUserHive {
         }
     }
     elseif ($DryRun) { & $Script "Registry::HKEY_USERS\W11Default(DRY)" }
+}
+
+# Adim: baslangicta "-> ..." yazar, is bitince "OK (Xsn)" yazar. Boylece ekranda
+# o an ne yapildigi ve ne kadar surdugu net gorunur (eski loglar "kuruluyor" der,
+# is bitse de mesaj degismezdi).
+function Invoke-Step {
+    param([string]$Ad, [scriptblock]$Is)
+    Write-Host ("  -> {0} ..." -f $Ad) -ForegroundColor Gray
+    Add-Content -Path $script:LogFile -Value ("[{0}] -> {1}" -f (Get-Date -f 'HH:mm:ss'), $Ad) -Encoding UTF8 -ErrorAction SilentlyContinue
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try { & $Is; $sw.Stop(); Write-Log ("{0} - bitti ({1:N1} sn)" -f $Ad, $sw.Elapsed.TotalSeconds) 'OK' }
+    catch { $sw.Stop(); Write-Log ("{0} - HATA ({1:N1} sn): {2}" -f $Ad, $sw.Elapsed.TotalSeconds, $_.Exception.Message) 'ERR'; $script:Hata++ }
+}
+
+# winget'i her yerde ayni sekilde bulur. Bulamazsa App Installer'i yeniden
+# kaydetmeyi dener ("winget bulunamadi" cogunlukla kayit eksikligindendir,
+# ozellikle SYSTEM baglaminda) ve tekrar arar. Bulursa exe yolunu, bulamazsa
+# $null doner.
+function Resolve-Winget {
+    # 1) Dogrudan surumlu WindowsApps yolu (en guncel)
+    $glob = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName | Select-Object -Last 1
+    if ($glob) { return $glob.FullName }
+    # 2) PATH
+    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    # 3) App Installer makinede var ama kayitli degil -> yeniden kaydet
+    $pkg = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pkg -and $pkg.InstallLocation) {
+        Write-Log "winget kayitli degil, App Installer yeniden kaydediliyor..." 'INFO'
+        try { Add-AppxPackage -DisableDevelopmentMode -Register "$($pkg.InstallLocation)\AppXManifest.xml" -ErrorAction Stop } catch {}
+        $glob = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName | Select-Object -Last 1
+        if ($glob) { Write-Log "winget yeniden kayittan sonra bulundu" 'OK'; return $glob.FullName }
+    }
+    return $null
 }
 
 # Cihaz laptop mu? Sasi tipi (ChassisTypes) tasinabilir sinifindaysa ya da
@@ -694,41 +731,39 @@ if ($Config.BloatwareKaldir) {
 if (-not $SkipApps -and $Apps.Count -gt 0) {
     Write-Baslik "Uygulama kurulumu (winget)"
 
-    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    $winget = Resolve-Winget
     if (-not $winget) {
-        # SYSTEM baglaminda winget PATH'te olmayabilir, elle bul
-        $wp = Get-ChildItem "$env:ProgramFiles\WindowsApps" -Filter winget.exe -Recurse -ErrorAction SilentlyContinue |
-              Sort-Object FullName -Descending | Select-Object -First 1
-        if ($wp) { $winget = $wp.FullName } 
-    } else { $winget = $winget.Source }
-
-    if (-not $winget) {
-        Write-Log "winget bulunamadi. App Installer'i Store'dan kurup tekrar calistir." 'WARN'
+        Write-Log "winget bulunamadi ve kaydedilemedi. Bu uygulamalar atlandi." 'WARN'
+        Write-Log "Cozum: Store'dan 'App Installer' kurup scripti tekrar calistirin." 'INFO'
     }
     else {
-        # Kaynak sozlesmesini kabul et
+        Write-Log "winget: $winget" 'INFO'
         & $winget source update --disable-interactivity 2>&1 | Out-Null
 
+        $toplam = $Apps.Count; $sira = 0
         foreach ($id in $Apps) {
-            if ($DryRun) { Write-Log "[DRY] Kurulacak: $id" 'SKIP'; continue }
-            Write-Log "Kuruluyor: $id ..."
+            $sira++
+            $etiket = "[{0}/{1}] {2}" -f $sira, $toplam, $id
+            if ($DryRun) { Write-Log "$etiket [DRY] kurulacak" 'SKIP'; continue }
+
+            # Zaten kurulu mu? Once bunu soyle -> "kuruluyor" derken aslinda kurulu
+            # olmasi yanilgisini onler.
+            & $winget list --id $id --exact --accept-source-agreements 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { Write-Log "$etiket zaten kurulu, atlandi" 'SKIP'; continue }
+
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            Write-Host ("  -> {0} indiriliyor + kuruluyor ..." -f $etiket) -ForegroundColor Gray
             $out = & $winget install --id $id --exact --silent --scope machine `
-                        --accept-package-agreements --accept-source-agreements `
-                        --disable-interactivity 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log "Kuruldu: $id" 'OK'
+                        --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+            if ($LASTEXITCODE -ne 0 -and "$out" -notmatch 'already installed|zaten') {
+                # machine scope desteklemeyen paketler icin user scope dene
+                $out = & $winget install --id $id --exact --silent `
+                            --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
             }
-            elseif ("$out" -match 'already installed|zaten yuklu') {
-                Write-Log "Zaten kurulu: $id" 'SKIP'
-            }
-            else {
-                # Bazi paketler machine scope desteklemez, user scope dene
-                $out2 = & $winget install --id $id --exact --silent `
-                            --accept-package-agreements --accept-source-agreements `
-                            --disable-interactivity 2>&1
-                if ($LASTEXITCODE -eq 0) { Write-Log "Kuruldu (user scope): $id" 'OK' }
-                else { Write-Log "Kurulamadi: $id (exit $LASTEXITCODE)" 'WARN'; $script:Hata++ }
-            }
+            $sw.Stop(); $sn = "{0:N1} sn" -f $sw.Elapsed.TotalSeconds
+            if ($LASTEXITCODE -eq 0)                              { Write-Log "$etiket kuruldu ($sn)" 'OK' }
+            elseif ("$out" -match 'already installed|zaten')      { Write-Log "$etiket zaten kurulu ($sn)" 'SKIP' }
+            else { Write-Log "$etiket KURULAMADI (exit $LASTEXITCODE, $sn)" 'WARN'; $script:Hata++ }
         }
     }
 }
@@ -742,14 +777,15 @@ if ($Config_KurChrome -and -not $SkipApps) {
 
     # Once winget dene (varsa hizli ve temiz). Basarisiz olursa resmi MSI'a dus.
     $kuruldu = $false
-    $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+    $wg = Resolve-Winget
     if ($wg -and -not $DryRun) {
-        $out = & $wg.Source install --id Google.Chrome --exact --silent --scope machine `
+        Write-Host "  -> Chrome winget ile deneniyor ..." -ForegroundColor Gray
+        $out = & $wg install --id Google.Chrome --exact --silent --scope machine `
                     --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
         if ($LASTEXITCODE -eq 0 -or "$out" -match 'already installed|zaten') {
             Write-Log "Chrome winget ile kuruldu/guncel" 'OK'; $kuruldu = $true
         } else {
-            Write-Log "winget Chrome'u kuramadi (muhtemelen hash uyusmazligi), MSI'a geciliyor" 'WARN'
+            Write-Log "winget Chrome'u kuramadi (muhtemelen hash uyusmazligi) -> resmi MSI'a geciliyor" 'WARN'
         }
     }
 
@@ -761,20 +797,52 @@ if ($Config_KurChrome -and -not $SkipApps) {
             Write-Log "[DRY] Chrome MSI indirilip kurulacak: $msiUrl" 'SKIP'
         } else {
             try {
-                Write-Log "Chrome MSI indiriliyor..."
+                # Indirme ve kurulum AYRI adimlar olarak loglaniyor -> ekranda o an
+                # ne oldugu net (eskiden "indiriliyor" der, kurulmus bile olurdu).
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                Write-Host "  -> Chrome MSI indiriliyor ..." -ForegroundColor Gray
                 $eskiPB = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
                 Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
                 $ProgressPreference = $eskiPB
+                $mb = [math]::Round((Get-Item $msi).Length / 1MB, 1)
+                Write-Log ("Chrome MSI indirildi ({0} MB, {1:N1} sn)" -f $mb, $sw.Elapsed.TotalSeconds) 'OK'
 
-                $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-                    '/i', "`"$msi`"", '/qn', '/norestart'
-                )
-                if ($p.ExitCode -eq 0) { Write-Log "Chrome kuruldu (Enterprise MSI, en son surum)" 'OK' }
+                Write-Host "  -> Chrome kuruluyor (msiexec) ..." -ForegroundColor Gray
+                $sw2 = [Diagnostics.Stopwatch]::StartNew()
+                $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart')
+                $sw2.Stop()
+                if ($p.ExitCode -eq 0) { Write-Log ("Chrome kuruldu (en son surum, {0:N1} sn)" -f $sw2.Elapsed.TotalSeconds) 'OK' }
                 else { Write-Log "Chrome MSI kurulumu basarisiz (exit $($p.ExitCode))" 'ERR'; $script:Hata++ }
             }
             catch { Write-Log "Chrome kurulamadi: $($_.Exception.Message)" 'ERR'; $script:Hata++ }
             finally { Remove-Item $msi -ErrorAction SilentlyContinue }
         }
+    }
+
+    # --- Chrome'u varsayilan tarayici yap ---
+    # Win11 tarayici varsayilanini UserChoice hash'i ile korur; tek registry
+    # anahtariyla zorlanamaz. Desteklenen yontem: DefaultAppAssociations XML'i
+    # DISM ile ice aktarmak. Bu YENI kullanici profilleri icin gecerlidir
+    # (ilk kurulum senaryosunda dogru olan budur). Chrome kurulu olmali (ustte).
+    if ($Config.ChromeVarsayilanTarayici -and -not $DryRun) {
+        $xml = Join-Path $env:TEMP 'defaultapps.xml'
+        @'
+<?xml version="1.0" encoding="UTF-8"?>
+<DefaultAssociations>
+  <Association Identifier="http"   ProgId="ChromeHTML" ApplicationName="Google Chrome" />
+  <Association Identifier="https"  ProgId="ChromeHTML" ApplicationName="Google Chrome" />
+  <Association Identifier=".htm"   ProgId="ChromeHTML" ApplicationName="Google Chrome" />
+  <Association Identifier=".html"  ProgId="ChromeHTML" ApplicationName="Google Chrome" />
+</DefaultAssociations>
+'@ | Set-Content -Path $xml -Encoding UTF8
+        try {
+            Dism.exe /Online /Import-DefaultAppAssociations:"$xml" | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "Chrome varsayilan tarayici yapildi (yeni profiller icin)" 'OK'
+                Write-Log "NOT: Zaten Edge kullanmis mevcut kullanicida Windows secimi koruyabilir" 'INFO'
+            } else { Write-Log "Varsayilan tarayici ayarlanamadi (DISM exit $LASTEXITCODE)" 'WARN' }
+        } catch { Write-Log "Varsayilan tarayici ayarlanamadi: $($_.Exception.Message)" 'WARN' }
+        finally { Remove-Item $xml -ErrorAction SilentlyContinue }
     }
 }
 
@@ -856,7 +924,7 @@ if ($Config.OemSurucuAraci -and -not $SkipApps) {
         default             { '' }
     }
 
-    $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+    $wg = Resolve-Winget
     if (-not $arac) {
         Write-Log "Bu marka icin ozel arac yok; suruculer Windows Update'ten gelir" 'INFO'
     }
@@ -867,8 +935,8 @@ if ($Config.OemSurucuAraci -and -not $SkipApps) {
         Write-Log "[DRY] OEM araci kurulacak: $arac" 'SKIP'
     }
     else {
-        Write-Log "Kuruluyor: $arac ..."
-        & $wg.Source install --id $arac --exact --silent --accept-package-agreements `
+        Write-Host "  -> $arac kuruluyor ..." -ForegroundColor Gray
+        & $wg install --id $arac --exact --silent --accept-package-agreements `
               --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) { Write-Log "OEM araci kuruldu: $arac" 'OK' }
         else { Write-Log "OEM araci kurulamadi (exit $LASTEXITCODE); elle kurulabilir" 'WARN' }

@@ -44,6 +44,17 @@
     bagli ISO'nun surucu harfi (orn: F:). ISO yolunu verirseniz baglanir, isi
     bitince cikarilir. Icerideki sources\setupprep.exe /product server calisir.
 
+.PARAMETER IsoIndir
+    ISO'yu Microsoft'un sunucusundan indirmek icin hedef klasor (orn: C:\ISO).
+    Klasorde 3 GB'tan buyuk bir ISO zaten varsa tekrar indirilmez. Indirme
+    basarisiz olursa elle indirme yonergesi yazilir. -SetupBaslat verilmediyse
+    indirilen ISO otomatik kullanilir.
+    FILO NOTU: her makineye 5-6 GB indirmek yerine bir kez indirip ag payina
+    koyun; -SetupBaslat \\sunucu\pay\Win11.iso cok daha hizli ve guvenilirdir.
+
+.PARAMETER IsoDil
+    Indirilecek ISO'nun dili (varsayilan: Turkish). Orn: 'English (United States)'.
+
 .PARAMETER Sessiz
     -SetupBaslat ile birlikte: hicbir soru sormadan yukseltir. Dosyalar ve
     kurulu programlar KORUNUR (/auto upgrade). Makine kendiliginden yeniden
@@ -63,6 +74,7 @@
     .\Win11-UyumsuzDonanim.ps1                      # sadece rapor
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme    # anahtarlari yaz, kurulumu elle baslat
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso
+    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir C:\ISO   # ISO yoksa indirsin
     .\Win11-UyumsuzDonanim.ps1 -UsbHazirla E:       # kurulum USB'sini hazirla
     X:\...\Win11-UyumsuzDonanim.ps1 -WinPE          # setup ekraninda Shift+F10
 
@@ -78,6 +90,8 @@
 param(
     [switch]$YerindeYukseltme,
     [string]$SetupBaslat,
+    [string]$IsoIndir,
+    [string]$IsoDil = 'Turkish',
     [switch]$Sessiz,
     [string]$UsbHazirla,
     [switch]$WinPE,
@@ -272,6 +286,142 @@ function Set-HwReqChk {
     if (-not (Test-Path $yol)) { New-Item -Path $yol -Force | Out-Null }
     New-ItemProperty -Path $yol -Name 'HwReqChkVars' -Value $deger -PropertyType MultiString -Force | Out-Null
     Yaz "HwReqChkVars yazildi (SecureBoot/TPM 2.0/8 GB RAM sagliyor gibi gorunur)" 'OK'
+}
+
+<#
+    Get-Win11Iso: Windows 11 ISO'sunu MICROSOFT'UN KENDI SUNUCUSUNDAN indirir.
+
+    Nasil: microsoft.com/software-download/windows11 sayfasinin arkasindaki
+    indirme servisi taklit edilir (tarayicida "surum sec > dil sec > indir"
+    adimlarinin yaptigi seyin aynisi):
+      1) Sayfadan guncel ProductEditionId okunur (sabit yazmiyoruz; her yeni
+         surumde degistigi icin sayfadan okumak tek saglam yol)
+      2) Oturum kaydedilir, dil listesi alinir
+      3) Secilen dilin x64 ISO baglantisi alinir ve indirilir
+
+    DIKKAT: Bu servis Microsoft'un BELGELENMEMIS ucudur. Microsoft yapisini
+    degistirirse ya da IP'yi engellerse (veri merkezi/VPN IP'lerini sik sik
+    engelliyor) calismaz. O yuzden basarisiz olursa script elle indirme
+    yonergesini yazar; is durmaz.
+
+    FILO ONERISI: 5-6 GB'lik ISO'yu her makineye indirmek yerine BIR KEZ indirip
+    ag payina koyun ve -SetupBaslat \\sunucu\pay\Win11.iso kullanin.
+#>
+function Get-Win11Iso {
+    param(
+        [Parameter(Mandatory)][string]$Hedef,
+        [string]$Dil = 'Turkish'
+    )
+
+    if (-not (Test-Path $Hedef)) {
+        if ($DryRun) { Yaz "[DRY] Klasor olusturulacak: $Hedef" 'SKIP' }
+        else { New-Item -ItemType Directory -Path $Hedef -Force | Out-Null }
+    }
+
+    # Zaten indirilmis mi? Chrome'da oldugu gibi: varsa tekrar indirme.
+    $mevcut = Get-ChildItem -LiteralPath $Hedef -Filter '*.iso' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Length -gt 3GB } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($mevcut) {
+        Yaz "ISO zaten var, tekrar indirilmiyor: $($mevcut.Name) ($([math]::Round($mevcut.Length/1GB,1)) GB)" 'SKIP'
+        return $mevcut.FullName
+    }
+
+    if ($DryRun) { Yaz "[DRY] Microsoft'tan Windows 11 ISO ($Dil) indirilecek -> $Hedef" 'SKIP'; return $null }
+
+    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+    $oturum = [guid]::NewGuid().ToString()
+    $eskiPB = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        # 1) Guncel surumun ProductEditionId'si sayfadan okunur
+        Yaz "Microsoft indirme sayfasi okunuyor..." 'INFO'
+        $sayfa = Invoke-WebRequest -Uri 'https://www.microsoft.com/en-us/software-download/windows11' `
+                    -UseBasicParsing -UserAgent $ua -TimeoutSec 60
+        $idler = [regex]::Matches($sayfa.Content, 'value="(\d{3,5})"[^>]*>\s*Windows 11') |
+                 ForEach-Object { $_.Groups[1].Value }
+        if (-not $idler) {
+            # Yedek kalip: option listesi bazen farkli siralanir
+            $idler = [regex]::Matches($sayfa.Content, '<option[^>]*value="(\d{3,5})"') |
+                     ForEach-Object { $_.Groups[1].Value }
+        }
+        $urunId = $idler | Select-Object -Last 1
+        if (-not $urunId) { throw "Sayfadan surum kimligi (ProductEditionId) okunamadi" }
+        Yaz "Surum kimligi: $urunId" 'OK'
+
+        # 2) Oturum kaydi (bu adim atlanirsa servis 715-123130 hatasi verir)
+        try {
+            Invoke-WebRequest -Uri "https://vlscppe.microsoft.com/fp/tags?org_id=y6jn8c31&session_id=$oturum" `
+                -UseBasicParsing -UserAgent $ua -TimeoutSec 30 | Out-Null
+        } catch {}
+
+        # 3) Dil listesi
+        $skuUrl = "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition" +
+                  "?profile=606624d44113&ProductEditionId=$urunId&SKU=undefined&friendlyFileName=undefined&Locale=en-US&sessionID=$oturum"
+        $sku = Invoke-RestMethod -Uri $skuUrl -UseBasicParsing -UserAgent $ua -TimeoutSec 60
+
+        $secili = $sku.Skus | Where-Object { $_.LocalizedLanguage -eq $Dil -or $_.Language -eq $Dil } | Select-Object -First 1
+        if (-not $secili) {
+            Yaz "'$Dil' bulunamadi, Ingilizce secildi. Mevcut diller: $(($sku.Skus.LocalizedLanguage | Select-Object -First 8) -join ', ') ..." 'WARN'
+            $secili = $sku.Skus | Where-Object { $_.LocalizedLanguage -match 'English \(United States\)' } | Select-Object -First 1
+        }
+        if (-not $secili) { throw "Dil secilemedi" }
+        Yaz "Dil: $($secili.LocalizedLanguage)" 'OK'
+
+        # 4) Indirme baglantisi (24 saat gecerli, oturuma bagli)
+        $linkUrl = "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku" +
+                   "?profile=606624d44113&productEditionId=undefined&SKU=$($secili.Id)&friendlyFileName=undefined&Locale=en-US&sessionID=$oturum"
+        $link = Invoke-RestMethod -Uri $linkUrl -UseBasicParsing -UserAgent $ua -TimeoutSec 60
+
+        if ($link.Errors) {
+            $hataMetni = "$($link.Errors[0].Value)"
+            # "Sentinel ... rejected" = IP tabanli engel. Microsoft veri merkezi,
+            # VPN ve bazi kurumsal proxy cikislarini engelliyor; ev/ofis
+            # baglantisindan ayni istek gecer.
+            if ($hataMetni -match 'Sentinel|reject') {
+                throw "Microsoft bu baglantiyi reddetti (VPN / veri merkezi / proxy IP'si olabilir): $hataMetni"
+            }
+            throw "Microsoft servisi reddetti: $hataMetni"
+        }
+        $x64 = $link.ProductDownloadOptions | Where-Object { $_.Uri -match 'x64' } | Select-Object -First 1
+        if (-not $x64) { $x64 = $link.ProductDownloadOptions | Select-Object -First 1 }
+        if (-not $x64.Uri) { throw "Indirme baglantisi alinamadi" }
+
+        $dosyaAd = [IO.Path]::GetFileName(($x64.Uri -split '\?')[0])
+        if (-not $dosyaAd -or $dosyaAd -notmatch '\.iso$') { $dosyaAd = "Win11_$urunId.iso" }
+        $hedefDosya = Join-Path $Hedef $dosyaAd
+
+        Yaz "Indiriliyor (5-6 GB, baglantiya gore 10-60 dk): $dosyaAd" 'INFO'
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+
+        # BITS varsa onu kullan: kesintide kaldigi yerden devam eder ve ilerleme gosterir
+        $bits = Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue
+        if ($bits) { Start-BitsTransfer -Source $x64.Uri -Destination $hedefDosya -Description 'Windows 11 ISO' }
+        else       { Invoke-WebRequest -Uri $x64.Uri -OutFile $hedefDosya -UseBasicParsing -UserAgent $ua }
+        $sw.Stop()
+
+        $boyutGB = [math]::Round((Get-Item $hedefDosya).Length / 1GB, 2)
+        if ($boyutGB -lt 3) { throw "Indirilen dosya cok kucuk ($boyutGB GB) - eksik indi" }
+        Yaz ("ISO indirildi: {0} ({1} GB, {2:N0} dk)" -f $dosyaAd, $boyutGB, $sw.Elapsed.TotalMinutes) 'OK'
+        return $hedefDosya
+    }
+    catch {
+        Yaz "ISO otomatik indirilemedi: $($_.Exception.Message)" 'ERR'
+        Write-Host ""
+        if ("$($_.Exception.Message)" -match 'reddetti|Sentinel') {
+            Yaz "Bu bir IP engeli - script hatasi degil. VPN acilsa kapatin, ya da" 'WARN'
+            Yaz "kurumsal proxy disinda bir baglantidan bir kez indirip paya koyun." 'WARN'
+            Write-Host ""
+        }
+        Yaz "Elle indirme (1 kez yapip ag payina koymak en saglami):" 'INFO'
+        Yaz "  https://www.microsoft.com/software-download/windows11 > 'Disk Image (ISO)'" 'INFO'
+        Yaz "  ya da Rufus (rufus.ie) icindeki ISO indirme dugmesi" 'INFO'
+        Yaz "Sonra: -SetupBaslat <ISO yolu> ile devam edin." 'INFO'
+        return $null
+    }
+    finally { $ProgressPreference = $eskiPB }
 }
 
 <#
@@ -505,6 +655,17 @@ if ($YerindeYukseltme) {
     }
 }
 
+if ($IsoIndir) {
+    Baslik "Windows 11 ISO indiriliyor"
+    $indirilen = Get-Win11Iso -Hedef $IsoIndir -Dil $IsoDil
+    if ($indirilen) {
+        # Ayrica -SetupBaslat verilmediyse indirilen ISO dogrudan kullanilir
+        if (-not $SetupBaslat) { $SetupBaslat = $indirilen }
+    } else {
+        $islemYapildi = $true   # rapor/yonerge verildi; "ne yapmali" listesini tekrarlama
+    }
+}
+
 if ($SetupBaslat) {
     Baslik "Kurulum baslatiliyor (setupprep.exe /product server)"
     # Anahtarlar yazilmadan setupprep tek basina da cogu makinede yeter, ama
@@ -556,10 +717,13 @@ if ($UsbHazirla) {
 if (-not $islemYapildi) {
     Baslik "Ne yapmali?"
     Write-Host "  ONEMLI: Uyumsuz makineye Windows Update ASLA yeni build (24H2/25H2)" -ForegroundColor Yellow
-    Write-Host "  teklif etmez - sadece aylik guncellemeler gelir. Yeni build icin ISO sart:" -ForegroundColor Yellow
-    Write-Host "  microsoft.com/software-download/windows11 > 'Disk Image (ISO)'" -ForegroundColor Gray
+    Write-Host "  teklif etmez - sadece aylik guncellemeler gelir. Yeni build icin ISO sart." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  1) Mevcut Windows'u yukseltmek (dosyalar/programlar kalsin) - EN KOLAY:" -ForegroundColor White
+    Write-Host "  0) ISO yoksa script kendisi indirsin:" -ForegroundColor White
+    Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir C:\ISO" -ForegroundColor Gray
+    Write-Host "       indirir + anahtarlari yazar + kurulumu baslatir (tek komut)" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  1) Mevcut Windows'u yukseltmek (dosyalar/programlar kalsin):" -ForegroundColor White
     Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso" -ForegroundColor Gray
     Write-Host "       anahtarlari yazar + setupprep.exe /product server ile kurulumu baslatir" -ForegroundColor DarkGray
     Write-Host "       (sadece anahtar yazip elle kurmak icin -SetupBaslat vermeyin)" -ForegroundColor DarkGray

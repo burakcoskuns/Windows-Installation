@@ -124,7 +124,7 @@ $Config = @{
     WindowsUpdate              = $true   # Eksik Windows guncellemelerini indir + kur
     SuruculeriGuncelle         = $true   # Surucu guncellemeleri (donanim ID'sine gore, asagiya bak)
     SurucuTamTarama            = $true   # Microsoft Update'teki ISTEGE BAGLI suruculeri de al (onemli: en son surumler burada)
-    SurucuOnPlanda             = $true   # $true: bekle + sonucu rapora yaz · $false: arka planda calissin (hizli biter)
+    SurucuOnPlanda             = $true   # $true: bekle + sonucu rapora yaz (10-30 dk uzatir) · $false: arka planda calissin, script hemen bitsin
     SurucuRaporu               = $true   # Kurulan surumleri ve hala eski kalan suruculeri listele
     OemSurucuAraci             = $true   # Ureticinin resmi surucu aracini kur (Dell/HP/Lenovo/Intel)
     OemSurucuOtoUygula         = $true   # Kurulan OEM aracini komut satiriyla calistirip suruculeri uygula
@@ -601,20 +601,46 @@ function Invoke-SurucuGuncelleme {
         $d = $session.CreateUpdateDownloader(); $d.Updates = $col; [void]$d.Download()
         Write-Log ("Suruculer indirildi ({0:N1} sn)" -f $sw.Elapsed.TotalSeconds) 'OK'
 
-        Write-Host "  -> Suruculer kuruluyor (cihazlar kisa sure kaybolabilir) ..." -ForegroundColor Gray
-        $sw2 = [Diagnostics.Stopwatch]::StartNew()
-        $i = $session.CreateUpdateInstaller(); $i.Updates = $col
-        $ir = $i.Install()
-        $sw2.Stop()
-        $rapor.YenidenBaslat = [bool]$ir.RebootRequired
+        # Suruculer TEK TEK kuruluyor. Hepsini tek Install() cagrisiyla kurmak
+        # daha hizli ama o cagri bitene kadar (10-30 dk) ekranda hicbir sey
+        # degismiyor ve script donmus gibi gorunuyor. Tek tek kurunca hangi
+        # surucude olundugu ve ne kadar surdugu aninda gorunur.
+        Write-Log ("{0} surucu kurulacak. Her biri 1-5 dk surebilir; toplam 10-30 dk." -f $col.Count) 'WARN'
+        Write-Log "Bu sirada cihazlar kisa sure kaybolabilir, ekran titreyebilir - normaldir." 'INFO'
 
+        $sw2 = [Diagnostics.Stopwatch]::StartNew()
         for ($n = 0; $n -lt $col.Count; $n++) {
-            $kod = $ir.GetUpdateResult($n).ResultCode   # 2 = basarili, 3 = uyarili, 4 = hata
-            if ($kod -eq 2 -or $kod -eq 3) { $rapor.Kurulan++;   Write-Log "  OK  $($col.Item($n).Title)" 'OK' }
-            else                           { $rapor.Basarisiz++; Write-Log "  HATA (kod $kod) $($col.Item($n).Title)" 'WARN' }
+            $u = $col.Item($n)
+            $tek = New-Object -ComObject Microsoft.Update.UpdateColl
+            [void]$tek.Add($u)
+
+            Write-Host ("     -> [{0}/{1}] {2} kuruluyor ..." -f ($n + 1), $col.Count, $u.Title) -ForegroundColor DarkGray
+            $swk = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $i = $session.CreateUpdateInstaller(); $i.Updates = $tek
+                $ir = $i.Install()
+                $swk.Stop()
+                if ($ir.RebootRequired) { $rapor.YenidenBaslat = $true }
+
+                $kod = $ir.GetUpdateResult(0).ResultCode   # 2 = basarili, 3 = uyarili, 4 = hata
+                if ($kod -eq 2 -or $kod -eq 3) {
+                    $rapor.Kurulan++
+                    Write-Log ("  [{0}/{1}] OK ({2:N0} sn) {3}" -f ($n + 1), $col.Count, $swk.Elapsed.TotalSeconds, $u.Title) 'OK'
+                } else {
+                    $rapor.Basarisiz++
+                    Write-Log ("  [{0}/{1}] HATA kod {2} ({3:N0} sn) {4}" -f ($n + 1), $col.Count, $kod, $swk.Elapsed.TotalSeconds, $u.Title) 'WARN'
+                }
+            }
+            catch {
+                # Tek surucunun patlamasi digerlerini durdurmasin
+                $swk.Stop(); $rapor.Basarisiz++
+                Write-Log ("  [{0}/{1}] kurulamadi: {2}" -f ($n + 1), $col.Count, $_.Exception.Message) 'WARN'
+            }
         }
-        Write-Log ("Surucu kurulumu bitti: {0} basarili, {1} basarisiz ({2:N1} sn)" -f `
-                    $rapor.Kurulan, $rapor.Basarisiz, $sw2.Elapsed.TotalSeconds) 'OK'
+        $sw2.Stop()
+
+        Write-Log ("Surucu kurulumu bitti: {0} basarili, {1} basarisiz ({2:N1} dk)" -f `
+                    $rapor.Kurulan, $rapor.Basarisiz, $sw2.Elapsed.TotalMinutes) 'OK'
         if ($rapor.YenidenBaslat) { Write-Log "Suruculerin tam etkili olmasi icin YENIDEN BASLATMA gerekiyor" 'WARN' }
     }
     catch {

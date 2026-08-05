@@ -8,10 +8,18 @@
     uyan atlatma yontemini uygular:
 
       1) YERINDE YUKSELTME (makine acikken, Windows uzerinden kurulum)
-         HKLM\SYSTEM\Setup\MoSetup -> AllowUpgradesWithUnsupportedTPMOrCPU = 1
-         Bu, Microsoft'un kendi belgeledigi (sonradan yayindan kaldirdigi)
-         anahtardir. TPM 1.2 + Secure Boot varsa, sadece CPU listede olmadigi
-         icin takilan makinelerde tek basina yeter.
+         Uc anahtar birden yazilir:
+         - HKLM\SYSTEM\Setup\MoSetup -> AllowUpgradesWithUnsupportedTPMOrCPU = 1
+           Microsoft'un kendi belgeledigi (sonra yayindan kaldirdigi) anahtar.
+         - HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\
+           HwReqChk -> HwReqChkVars (MULTI_SZ) = SecureBoot/TPM 2.0/8 GB "var"
+           24H2'nin yeni denetimi burayi okur; asil ise yarayan budur.
+         - LabConfig (zarari yok, bazi senaryolarda setup bunu da okur)
+
+      1b) SETUPPREP YOLU (en pratik yontem)
+         sources\setupprep.exe /product server
+         24H2'de eski `setup.exe /product server` "unknown command" verir;
+         calisan komut setupprep.exe'dir. -SetupBaslat ile otomatik yapilir.
 
       2) TEMIZ KURULUM (USB'den kurulum, setup ekraninda)
          HKLM\SYSTEM\Setup\LabConfig -> BypassTPMCheck / BypassSecureBootCheck /
@@ -28,8 +36,13 @@
     kesin olarak olcer ve bosuna ugrasmanizi engeller.
 
 .PARAMETER YerindeYukseltme
-    Calisan Windows'a MoSetup + LabConfig anahtarlarini yazar. Ardindan ISO'yu
-    baglayip setup.exe calistirin.
+    Calisan Windows'a MoSetup + HwReqChk + LabConfig anahtarlarini yazar.
+    Ardindan ISO'yu baglayip setup.exe calistirin (ya da -SetupBaslat kullanin).
+
+.PARAMETER SetupBaslat
+    Yukseltmeyi dogrudan baslatir: ISO dosyasinin yolu (orn: C:\Win11.iso) ya da
+    bagli ISO'nun surucu harfi (orn: F:). ISO yolunu verirseniz baglanir, isi
+    bitince cikarilir. Icerideki sources\setupprep.exe /product server calisir.
 
 .PARAMETER UsbHazirla
     Kurulum USB'sinin surucu harfi (orn: E:). Koke autounattend.xml yazar.
@@ -43,7 +56,8 @@
 
 .EXAMPLE
     .\Win11-UyumsuzDonanim.ps1                      # sadece rapor
-    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme    # mevcut Windows'u yukseltmek icin
+    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme    # anahtarlari yaz, kurulumu elle baslat
+    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso
     .\Win11-UyumsuzDonanim.ps1 -UsbHazirla E:       # kurulum USB'sini hazirla
     X:\...\Win11-UyumsuzDonanim.ps1 -WinPE          # setup ekraninda Shift+F10
 
@@ -58,6 +72,7 @@
 [CmdletBinding()]
 param(
     [switch]$YerindeYukseltme,
+    [string]$SetupBaslat,
     [string]$UsbHazirla,
     [switch]$WinPE,
     [switch]$DryRun
@@ -220,6 +235,83 @@ function Set-MoSetup {
 }
 
 <#
+    Set-HwReqChk: 24H2'nin yeni donanim denetimini (HwReqChk) kandirir.
+
+    Setup, denetim sonuclarini bu MULTI_SZ degerden okur; buraya "Secure Boot
+    var, TPM 2.0 var, 8 GB RAM var" yazilinca denetim gecmis sayilir. 24H2'de
+    LabConfig/MoSetup'in yetmedigi durumlarin cogunu bu cozer.
+    (Neowin rehberindeki "Option 2" budur.)
+#>
+function Set-HwReqChk {
+    $yol = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\HwReqChk'
+    $deger = @(
+        'SQ_SecureBootCapable=TRUE'
+        'SQ_SecureBootEnabled=TRUE'
+        'SQ_TpmVersion=2'
+        'SQ_RamMB=8192'
+    )
+    if ($DryRun) { Yaz "[DRY] $yol\HwReqChkVars = $($deger -join ' | ')" 'SKIP'; return }
+    if (-not (Test-Path $yol)) { New-Item -Path $yol -Force | Out-Null }
+    New-ItemProperty -Path $yol -Name 'HwReqChkVars' -Value $deger -PropertyType MultiString -Force | Out-Null
+    Yaz "HwReqChkVars yazildi (SecureBoot/TPM 2.0/8 GB RAM sagliyor gibi gorunur)" 'OK'
+}
+
+<#
+    Start-SetupPrep: yukseltmeyi ureticinin "sunucu urunu" yolundan baslatir.
+
+    24H2'de eski `setup.exe /product server` numarasi "unknown command" verir;
+    calisan komut sources klasorundeki setupprep.exe'dir. Ekranda "Windows
+    Server" yazar ama kurulan sey mevcut surumunuzun normal karsiligidir.
+    (Neowin rehberindeki "Option 1" budur.)
+#>
+function Start-SetupPrep {
+    param([Parameter(Mandatory)][string]$Kaynak)
+
+    $harf = $null
+    $baglandi = $false
+    try {
+        if ($Kaynak -match '\.iso$') {
+            if (-not (Test-Path $Kaynak)) { Yaz "ISO bulunamadi: $Kaynak" 'ERR'; return }
+            if ($DryRun) { Yaz "[DRY] ISO baglanip setupprep.exe /product server calistirilacak" 'SKIP'; return }
+            Yaz "ISO baglaniyor: $Kaynak" 'INFO'
+            $img = Mount-DiskImage -ImagePath (Resolve-Path $Kaynak).Path -PassThru
+            Start-Sleep -Seconds 2
+            $harf = ($img | Get-Volume).DriveLetter + ':'
+            $baglandi = $true
+            Yaz "ISO baglandi: $harf" 'OK'
+        } else {
+            $harf = $Kaynak.TrimEnd('\')
+            if ($harf -notmatch ':') { $harf = "$harf`:" }
+        }
+
+        # Join-Path kullanilmaz: olmayan bir surucu harfi verilirse ("Cannot find
+        # drive F") anlamsiz bir hata firlatir. Duz birlestirip Test-Path ile
+        # sessizce kontrol etmek daha net bir mesaj verir.
+        $prep = "$harf\sources\setupprep.exe"
+        if (-not (Test-Path -LiteralPath $prep -ErrorAction SilentlyContinue)) {
+            Yaz "setupprep.exe bulunamadi: $prep" 'ERR'
+            Yaz "ISO'yu baglayip surucu harfini verin (orn: -SetupBaslat F:) ya da" 'INFO'
+            Yaz "dogrudan ISO dosyasinin yolunu verin (orn: -SetupBaslat C:\Win11.iso)" 'INFO'
+            return
+        }
+        if ($DryRun) { Yaz "[DRY] Calistirilacak: $prep /product server" 'SKIP'; return }
+
+        Yaz "Calistiriliyor: setupprep.exe /product server" 'OK'
+        Yaz "Ekranda 'Windows Server' yazacak - normaldir, mevcut surumunuz kurulur." 'INFO'
+        # Setup ayri pencerede acilir; ISO'yu erken cikarmamak icin BEKLENIR.
+        Start-Process -FilePath $prep -ArgumentList '/product','server' -Wait
+        Yaz "Kurulum penceresi kapandi" 'INFO'
+    }
+    catch { Yaz "setupprep baslatilamadi: $($_.Exception.Message)" 'ERR' }
+    finally {
+        if ($baglandi) {
+            Yaz "ISO baglantisi kaldiriliyor" 'INFO'
+            try { Dismount-DiskImage -ImagePath (Resolve-Path $Kaynak).Path | Out-Null } catch {}
+        }
+    }
+}
+
+<#
     New-AutounattendBypass: kurulum USB'sinin kokune autounattend.xml yazar.
     Setup, windowsPE asamasinda bu dosyayi otomatik okur ve icindeki reg
     komutlarini DENETIMDEN ONCE calistirir -> Shift+F10 ile elle ugrasmak
@@ -338,11 +430,27 @@ $islemYapildi = $false
 if ($YerindeYukseltme) {
     Baslik "Yerinde yukseltme icin anahtarlar yaziliyor"
     Set-MoSetup
+    Set-HwReqChk       # 24H2'nin yeni denetimi asil burayi okur
     Set-LabConfig      # zarari yok; bazi senaryolarda setup bunlari da okur
     $islemYapildi = $true
-    Write-Host ""
-    Yaz "Sirada: Windows 11 ISO'sunu indirin, cift tiklayip baglayin (mount)," 'INFO'
-    Yaz "surucudeki setup.exe'yi calistirin ve 'Kisisel dosyalari ve uygulamalari koru' secin." 'INFO'
+    if (-not $SetupBaslat) {
+        Write-Host ""
+        Yaz "Sirada: Windows 11 ISO'sunu indirin, cift tiklayip baglayin (mount)," 'INFO'
+        Yaz "surucudeki setup.exe'yi calistirin ve 'Kisisel dosyalari ve uygulamalari koru' secin." 'INFO'
+        Yaz "Takilirsa: -SetupBaslat <ISO yolu> ile setupprep.exe /product server yolunu deneyin." 'INFO'
+    }
+}
+
+if ($SetupBaslat) {
+    Baslik "Kurulum baslatiliyor (setupprep.exe /product server)"
+    # Anahtarlar yazilmadan setupprep tek basina da cogu makinede yeter, ama
+    # ikisi birlikte en yuksek basari sansini verir.
+    if (-not $YerindeYukseltme) {
+        Yaz "Once denetim anahtarlari da yaziliyor (garanti olsun)" 'INFO'
+        Set-MoSetup; Set-HwReqChk
+    }
+    Start-SetupPrep -Kaynak $SetupBaslat
+    $islemYapildi = $true
 }
 
 if ($WinPE -or ($script:PEdeyiz -and -not $YerindeYukseltme -and -not $UsbHazirla)) {
@@ -380,20 +488,23 @@ if ($UsbHazirla) {
 
 if (-not $islemYapildi) {
     Baslik "Ne yapmali?"
-    Write-Host "  1) Mevcut Windows'u yukseltmek (dosyalar/programlar kalsin):" -ForegroundColor White
-    Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme" -ForegroundColor Gray
-    Write-Host "       sonra ISO'yu baglayip setup.exe" -ForegroundColor DarkGray
+    Write-Host "  1) Mevcut Windows'u yukseltmek (dosyalar/programlar kalsin) - EN KOLAY:" -ForegroundColor White
+    Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso" -ForegroundColor Gray
+    Write-Host "       anahtarlari yazar + setupprep.exe /product server ile kurulumu baslatir" -ForegroundColor DarkGray
+    Write-Host "       (sadece anahtar yazip elle kurmak icin -SetupBaslat vermeyin)" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  2) Sifirdan kurulum (USB ile, onerilen):" -ForegroundColor White
+    Write-Host "  2) Sifirdan kurulum (USB ile):" -ForegroundColor White
     Write-Host "       .\Win11-UyumsuzDonanim.ps1 -UsbHazirla E:" -ForegroundColor Gray
-    Write-Host "       USB'yi Rufus/Media Creation Tool ile hazirlayin, sonra bu komutu calistirin" -ForegroundColor DarkGray
+    Write-Host "       USB'yi Media Creation Tool/Rufus ile hazirlayin, sonra bu komutu calistirin" -ForegroundColor DarkGray
+    Write-Host "       Rufus kullaniyorsaniz zaten 'Remove requirement for 4GB+ RAM, Secure Boot" -ForegroundColor DarkGray
+    Write-Host "       and TPM 2.0' kutusunu isaretlemeniz yeterli - bu adim gerekmez." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  3) Kurulum ekraninda takildiysaniz (Shift+F10 ile komut istemi):" -ForegroundColor White
     Write-Host "       reg add HKLM\System\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f" -ForegroundColor Gray
     Write-Host "       reg add HKLM\System\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "  Alternatif: Rufus ile USB hazirlarken cikan pencerede" -ForegroundColor White
-    Write-Host "  'Remove requirement for 4GB+ RAM, Secure Boot and TPM 2.0' kutusunu isaretleyin." -ForegroundColor Gray
+    Write-Host "  NOT: 24H2'de artik CALISMAYAN yontemler -> setup.exe /product server," -ForegroundColor DarkGray
+    Write-Host "  Installation Assistant uyumluluk sorun gidericisi, .reg birlestirme." -ForegroundColor DarkGray
 }
 
 Baslik "Bilinmesi gerekenler"

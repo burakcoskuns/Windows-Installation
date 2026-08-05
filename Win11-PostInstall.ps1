@@ -380,6 +380,40 @@ function Invoke-Step {
 }
 
 <#
+    Invoke-Yerel: harici bir exe'yi GUVENLI calistirir; cikis kodunu ve ciktisini
+    doner.
+
+    Neden: $ErrorActionPreference = 'Stop' iken harici bir program stderr'e tek
+    satir yazsa PowerShell bunu "NativeCommandError" sayip SCRIPTI KOMPLE
+    DURDURUYOR. auditpol Turkce Windows'ta tam bunu yapip kurulumu yarida kesti.
+    Burada stderr, cikti akisina alinir (2>&1) ve tercih gecici olarak
+    'Continue' yapilir -> hata artik sadece rapor edilir, akis surer.
+#>
+function Invoke-Yerel {
+    param(
+        [Parameter(Mandatory)][string]$Dosya,
+        [string[]]$Argumanlar = @()
+    )
+    $eski = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $cikti = & $Dosya @Argumanlar 2>&1
+        # Cikis kodu uretmeyen cagrilarda $LASTEXITCODE $null kalir; bunu
+        # "hata" saymak yanlis uyari uretirdi -> 0 kabul edilir.
+        $kod = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+        return [pscustomobject]@{
+            Kod    = $kod
+            Cikti  = ($cikti | Out-String).Trim()
+            Basari = ($kod -eq 0)
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Kod = -1; Cikti = $_.Exception.Message; Basari = $false }
+    }
+    finally { $ErrorActionPreference = $eski }
+}
+
+<#
     Invoke-ZamanAsimiyla: verilen isi ayri bir surecte calistirir ve en fazla
     $Saniye kadar bekler. Bitirirse $true, sure dolarsa $false doner.
 
@@ -669,7 +703,7 @@ function Test-Laptop {
 function Show-BatteryHealth {
     $xml = Join-Path $env:TEMP "batt_$PID.xml"
     try {
-        powercfg.exe /batteryreport /xml /output "$xml" | Out-Null
+        Invoke-Yerel powercfg.exe @('/batteryreport','/xml','/output',"$xml") | Out-Null
         if (-not (Test-Path $xml)) { Write-Log "Batarya raporu olusturulamadi" 'WARN'; return }
         $icerik = Get-Content $xml -Raw
 
@@ -968,8 +1002,9 @@ if ($Config.SaatDilimiOtomatik -and -not $DryRun) {
 }
 
 if ($Config.HibernasyonKapat -and -not $DryRun) {
-    powercfg.exe /hibernate off | Out-Null
-    Write-Log "Hibernasyon kapatildi (hiberfil.sys silindi)" 'OK'
+    $hib = Invoke-Yerel powercfg.exe @('/hibernate','off')
+    if ($hib.Basari) { Write-Log "Hibernasyon kapatildi (hiberfil.sys silindi)" 'OK' }
+    else { Write-Log "Hibernasyon kapatilamadi: $($hib.Cikti)" 'WARN' }
 }
 
 if ($Config.OfisGucPlani -and -not $DryRun) {
@@ -979,10 +1014,10 @@ if ($Config.OfisGucPlani -and -not $DryRun) {
     if ($script:Laptop) {
         Write-Log "Laptop -> guc plani Dengeli birakildi (pil/isi icin dogru secim)" 'INFO'
     } else {
-        try {
-            powercfg.exe /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null  # High performance
-            Write-Log "Guc plani: Yuksek performans (masaustu)" 'OK'
-        } catch { Write-Log "Guc plani degistirilemedi" 'WARN' }
+        # High performance plan GUID'i
+        $gp = Invoke-Yerel powercfg.exe @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+        if ($gp.Basari) { Write-Log "Guc plani: Yuksek performans (masaustu)" 'OK' }
+        else { Write-Log "Guc plani degistirilemedi: $($gp.Cikti)" 'WARN' }
     }
 }
 
@@ -1041,11 +1076,21 @@ if ($Config.USBDosyaDenetimi -and -not $DryRun) {
     # "Removable Storage" alt kategorisi tam bu is icin: USB/harici diske her
     # dosya erisimini otomatik denetler, klasor SACL'i gerekmez.
     # Sonuc: Guvenlik gunlugu Event ID 4663 (kim, hangi dosya, hangi surec).
-    & auditpol.exe /set /subcategory:"Removable Storage" /success:enable /failure:enable | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    #
+    # ADI DEGIL GUID KULLANILIYOR: auditpol alt kategori adlarini SISTEM DILINDE
+    # bekler. Turkce Windows'ta /subcategory:"Removable Storage" hata 0x57
+    # (gecersiz parametre) verir. GUID her dilde ayni:
+    #   {0CCE9245-...} = Removable Storage / Cikarilabilir Depolama
+    $sonuc = Invoke-Yerel auditpol.exe @(
+        '/set', '/subcategory:{0CCE9245-69AE-11D9-BED3-505054503030}',
+        '/success:enable', '/failure:enable'
+    )
+    if ($sonuc.Basari) {
         Write-Log "USB dosya erisimi denetimi acildi (Guvenlik gunlugu, Event 4663)" 'OK'
         Write-Log "Uzun vade: kayitlari NinjaOne'a aktarin, yerel gunluk sinirlidir" 'INFO'
-    } else { Write-Log "USB denetimi acilamadi (auditpol exit $LASTEXITCODE)" 'WARN' }
+    } else {
+        Write-Log "USB denetimi acilamadi (auditpol kod $($sonuc.Kod)): $($sonuc.Cikti)" 'WARN'
+    }
 }
 
 # Silme denetimi bir KLASORE hedeflenir (tum diski denetlemek asiri gurultu uretir).
@@ -1054,7 +1099,14 @@ if ($Config.SilmeDenetimiKlasor -and -not $DryRun) {
         Write-Log "Silme denetimi klasoru yok: $($Config.SilmeDenetimiKlasor)" 'WARN'
     } else {
         Write-Baslik "Silme denetimi: $($Config.SilmeDenetimiKlasor)"
-        & auditpol.exe /set /subcategory:"File System" /success:enable /failure:enable | Out-Null
+        # {0CCE921D-...} = File System / Dosya Sistemi (dil bagimsiz GUID)
+        $fsSonuc = Invoke-Yerel auditpol.exe @(
+            '/set', '/subcategory:{0CCE921D-69AE-11D9-BED3-505054503030}',
+            '/success:enable', '/failure:enable'
+        )
+        if (-not $fsSonuc.Basari) {
+            Write-Log "Dosya sistemi denetimi acilamadi (kod $($fsSonuc.Kod)): $($fsSonuc.Cikti)" 'WARN'
+        }
         try {
             # SACL: Herkes icin silme islemlerini basari olarak denetle (Event 4660/4663)
             $acl = Get-Acl -Path $Config.SilmeDenetimiKlasor -Audit
@@ -1292,14 +1344,14 @@ if ($Config_KurChrome -and -not $SkipApps) {
 </DefaultAssociations>
 '@ | Set-Content -Path $xml -Encoding UTF8
         try {
-            Dism.exe /Online /Import-DefaultAppAssociations:"$xml" | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            $dism = Invoke-Yerel Dism.exe @('/Online',"/Import-DefaultAppAssociations:$xml")
+            if ($dism.Basari) {
                 Write-Log "Chrome varsayilan tarayici yapildi (yeni profiller icin)" 'OK'
                 Write-Log "NOT: Zaten Edge kullanmis mevcut kullanicida Windows secimi koruyabilir" 'INFO'
                 Add-Ozet 'Varsayilan tarayici' 'Chrome (yeni profiller icin)'
             } else {
-                Write-Log "Varsayilan tarayici ayarlanamadi (DISM exit $LASTEXITCODE)" 'WARN'
-                Add-Ozet 'Varsayilan tarayici' "ayarlanamadi (DISM exit $LASTEXITCODE)"
+                Write-Log "Varsayilan tarayici ayarlanamadi (DISM kod $($dism.Kod))" 'WARN'
+                Add-Ozet 'Varsayilan tarayici' "ayarlanamadi (DISM kod $($dism.Kod))"
             }
         } catch { Write-Log "Varsayilan tarayici ayarlanamadi: $($_.Exception.Message)" 'WARN' }
         finally { Remove-Item $xml -ErrorAction SilentlyContinue }

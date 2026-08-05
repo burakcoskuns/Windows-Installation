@@ -6,8 +6,14 @@
     Yeni kurulan bir Windows 11 makinede elle yapilan ayarlari otomatiklestirir:
     taskbar/explorer duzeni, masaustu ikonlari, gereksiz UWP uygulamalarinin
     kaldirilmasi, gizlilik/telemetri ayarlari, ofis odakli performans ayarlari,
-    donanim sagligi raporu (batarya + disk), Windows/surucu guncellemesi, uretici
-    surucu araci ve winget ile uygulama kurulumu (Chrome resmi MSI ile en son surum).
+    donanim sagligi raporu (batarya + disk), Windows guncellemesi, uretici
+    surucu araci ve winget ile uygulama kurulumu (Chrome kurulu degilse en son
+    surum resmi MSI ile; kuruluysa tekrar indirilmez).
+
+    SURUCULER: her cihazin donanim kimligi (hardware ID) Windows Update'e
+    sorulur; yalniz kurulu olandan DAHA YENI suruculer indirilip kurulur.
+    Microsoft Update servisi kaydedilerek "istege bagli surucu guncellemeleri"
+    de kapsanir, ayrica Dell/HP/Lenovo araci komut satirindan calistirilir.
 
     Performans ayarlari OFIS bilgisayari icin secildi: gorsel efekt/animasyon
     kapatma, saydamlik kapatma, masaustunde yuksek guc plani (laptopta dokunulmaz),
@@ -25,6 +31,10 @@
 .PARAMETER SkipApps
     winget ile uygulama kurulumunu atlar.
 
+.PARAMETER NoPause
+    Sonunda ozet raporu gosterip beklemez, pencereyi kapatir. Otomasyon
+    (NinjaOne / GPO / Intune / zamanlanmis gorev) icin kullanin.
+
 .EXAMPLE
     .\Win11-PostInstall.ps1
     .\Win11-PostInstall.ps1 -DryRun
@@ -33,13 +43,16 @@
 .NOTES
     Yonetici hakki gerekir. Script kendini otomatik yukseltir.
     Sonunda explorer.exe yeniden baslatilir.
+    Is bitince pencere KENDILIGINDEN KAPANMAZ: ozet rapor gosterilir ve
+    kullanici kapatana kadar acik kalir (-NoPause ile kapali).
 #>
 
 [CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$SkipApps,
-    [switch]$NoRestartExplorer
+    [switch]$NoRestartExplorer,
+    [switch]$NoPause          # Otomasyonda (NinjaOne/GPO/Intune) sonda bekleme
 )
 
 #region ============================ AYARLAR ============================
@@ -58,6 +71,7 @@ $Config = @{
 
     # --- Masaustu ---
     MasaustuBuBilgisayar       = $true   # "Bu bilgisayar" ikonunu masaustune ekle
+    MasaustuKontrolPaneli      = $true   # "Denetim Masasi" (Kontrol Paneli) ikonunu masaustune ekle
 
     # --- Baslat menusu ---
     StartWebAramaKapat         = $true   # Bing / web sonuclarini kapat
@@ -92,6 +106,7 @@ $Config = @{
     SaydamlikKapat             = $true   # Transparency efektini kapat (hafif GPU/islemci tasarrufu)
     OfisGucPlani               = $true   # Masaustunde Yuksek Performans; LAPTOP'ta Dengeli birakilir (pil/isi)
     DepoTemizlemeOtomatik      = $true   # Storage Sense: gecici dosyalari otomatik temizle
+    OyunOzellikleriKapat       = $true   # Oyun Cubugu (Win+G), Game DVR kaydi ve Xbox servisleri -> ofiste gereksiz, arka planda kaynak yer
     SysMainKapat               = $false  # SSD'de disk yukunu azaltabilir; emin degilsen $false birak
     AramaIndeksiKapat          = $false  # OFISTE ACIK BIRAK -> dosya/e-posta aramasini hizlandirir
 
@@ -107,14 +122,19 @@ $Config = @{
 
     # --- Guncelleme (kurulum sonunda calisir, uzun surebilir) ---
     WindowsUpdate              = $true   # Eksik Windows guncellemelerini indir + kur
-    SuruculeriGuncelle         = $true   # Windows Update uzerinden surucu guncellemeleri
+    SuruculeriGuncelle         = $true   # Surucu guncellemeleri (donanim ID'sine gore, asagiya bak)
+    SurucuTamTarama            = $true   # Microsoft Update'teki ISTEGE BAGLI suruculeri de al (onemli: en son surumler burada)
+    SurucuOnPlanda             = $true   # $true: bekle + sonucu rapora yaz · $false: arka planda calissin (hizli biter)
+    SurucuRaporu               = $true   # Kurulan surumleri ve hala eski kalan suruculeri listele
     OemSurucuAraci             = $true   # Ureticinin resmi surucu aracini kur (Dell/HP/Lenovo/Intel)
+    OemSurucuOtoUygula         = $true   # Kurulan OEM aracini komut satiriyla calistirip suruculeri uygula
 }
 
 # Chrome ayri kuruluyor (asagidaki KurChrome) — winget'in Chrome paketi Google
 # installer'i ayni URL'de guncelledigi icin sik sik "hash uyusmuyor" hatasi verir.
 # Resmi Enterprise MSI her zaman en son surumu makine geneli kurar.
 $Config_KurChrome = $true
+$Config_ChromeZorlaKur = $false               # $true: kurulu olsa da MSI'i indirip uzerine kur
 $Config['ChromeVarsayilanTarayici'] = $true   # Chrome'u varsayilan tarayici yap (yeni profiller)
 
 # winget ile kurulacak uygulamalar (winget id)
@@ -131,48 +151,106 @@ $Apps = @(
     # 'AnyDeskSoftwareGmbH.AnyDesk'
 )
 
-# Kaldirilacak UWP uygulamalar (paket adinda gecen ifade)
+# Kaldirilacak UWP uygulamalar. Eslesme paket adinda GECEN ifadeye gore yapilir
+# (ornek: 'Xbox' yazarsan tum Xbox paketleri gider). Ofis bilgisayari icin
+# secildi: is uretmeyen, oyun/eglence/reklam amacli her sey kaldirilir.
 $Bloatware = @(
-    'Clipchamp.Clipchamp'
-    'Microsoft.3DBuilder'
+    # --- Oyun / Xbox (ofiste tamamen gereksiz) ---
+    'Microsoft.GamingApp'                  # Win11'deki YENI Xbox uygulamasi (Store oyunlari)
+    'Microsoft.XboxApp'                    # Eski Xbox uygulamasi (Win10)
+    'Microsoft.Xbox.TCUI'
+    'Microsoft.XboxGameOverlay'
+    'Microsoft.XboxGamingOverlay'          # Oyun Cubugu (Win+G)
+    'Microsoft.XboxSpeechToTextOverlay'
+    'Microsoft.XboxIdentityProvider'       # Xbox oturum acma
+    'Microsoft.GamingServices'             # Store oyun servisi
+    'Microsoft.MicrosoftSolitaireCollection'
+    'Microsoft.MinecraftUWP'
+    'king.com.'                            # Candy Crush ve digerleri
+    'Microsoft.MicrosoftMahjong'
+    'Microsoft.MicrosoftJigsaw'
+    'Microsoft.MicrosoftSudoku'
+    'Microsoft.BingCasual'
+
+    # --- Eglence / medya ---
+    'Clipchamp.Clipchamp'                  # Video editor
+    'Microsoft.ZuneMusic'                  # Media Player / Groove
+    'Microsoft.ZuneVideo'                  # Filmler ve TV
+    'SpotifyAB.SpotifyMusic'
+    'Netflix'
+    'AmazonVideo.PrimeVideo'
+    'Disney'
+    'TikTok'
+    'Facebook'
+    'Instagram'
+    'Twitter'
+    'Duolingo'
+    'ACGMediaPlayer'
+    'EclipseManager'
+    'ActiproSoftware'
+
+    # --- Haber / reklam / Bing icerikleri ---
     'Microsoft.BingNews'
     'Microsoft.BingWeather'
     'Microsoft.BingSearch'
-    'Microsoft.GetHelp'
-    'Microsoft.Getstarted'
-    'Microsoft.Messaging'
-    'Microsoft.Microsoft3DViewer'
-    'Microsoft.MicrosoftOfficeHub'
-    'Microsoft.MicrosoftSolitaireCollection'
-    'Microsoft.MixedReality.Portal'
+    'Microsoft.BingFinance'
+    'Microsoft.BingSports'
+    'Microsoft.BingTravel'
+    'Microsoft.BingHealthAndFitness'
+    'Microsoft.BingFoodAndDrink'
+    'Microsoft.BingTranslator'
     'Microsoft.News'
-    'Microsoft.Office.OneNote'
-    'Microsoft.OneConnect'
-    'Microsoft.People'
-    'Microsoft.Print3D'
+  # 'Microsoft.Advertising.Xaml'           # KAPALI: bazi Store uygulamalarinin bagimliligi; kaldirinca o uygulamalar acilmayabilir
+
+    # --- Yapay zeka / asistan / oneri ---
+    'Microsoft.Copilot'
+    'Microsoft.549981C3F5F10'              # Cortana
+    'Microsoft.Windows.DevHome'            # Gelistirici paneli
+    'Microsoft.PowerAutomateDesktop'       # Onceden yuklu, lisanssiz kullanilmiyor
+
+    # --- Iletisim / kisisel (kurumsal hesapla islevsiz) ---
     'Microsoft.SkypeApp'
+    'Microsoft.Messaging'
+    'Microsoft.People'
+    'Microsoft.YourPhone'                  # Telefon Baglantisi
+    'MicrosoftWindows.CrossDevice'         # Telefon entegrasyonu bileseni
+    'Microsoft.WindowsCommunicationsApps'  # Mail ve Takvim (Outlook varsa gereksiz)
+    'Microsoft.OutlookForWindows'          # "Yeni Outlook" (reklamli, kurumsal Outlook varken karisiklik yaratir)
+    'MicrosoftTeams'                       # Kisisel Teams (Chat)
+    'MSTeams'                              # Yeni Teams -> kurumsal Teams kuruluyorsa bunu listeden cikarin
+    'LinkedInforWindows'
+    'MicrosoftCorporationII.MicrosoftFamily'
+
+    # --- 3D / karma gerceklik (eski, kullanilmiyor) ---
+    'Microsoft.3DBuilder'
+    'Microsoft.Microsoft3DViewer'
+    'Microsoft.Print3D'
+    'Microsoft.MixedReality.Portal'
+
+    # --- Diger gereksizler ---
+    'Microsoft.GetHelp'
+    'Microsoft.Getstarted'                 # "Ipuclari"
+    'Microsoft.Office.OneNote'             # Store surumu (Office'in OneNote'u ayri)
+    'Microsoft.OneConnect'                 # Mobil planlar
     'Microsoft.Todos'
+    'Microsoft.Whiteboard'
+    'Microsoft.MicrosoftJournal'
     'Microsoft.WindowsAlarms'
     'Microsoft.WindowsFeedbackHub'
     'Microsoft.WindowsMaps'
     'Microsoft.WindowsSoundRecorder'
-    'Microsoft.Xbox.TCUI'
-    'Microsoft.XboxApp'
-    'Microsoft.XboxGameOverlay'
-    'Microsoft.XboxGamingOverlay'
-    'Microsoft.XboxSpeechToTextOverlay'
-    'Microsoft.YourPhone'
-    'Microsoft.ZuneMusic'
-    'Microsoft.ZuneVideo'
-    'MicrosoftTeams'
-    'MSTeams'
-    'Microsoft.Copilot'
-    'Microsoft.549981C3F5F10'      # Cortana
-    'MicrosoftCorporationII.QuickAssist'
+    'Microsoft.NetworkSpeedTest'
+    'Microsoft.Wallet'
+    'Microsoft.MicrosoftPowerBIForWindows'
+    'Microsoft.Sway'
+    'MicrosoftCorporationII.QuickAssist'   # Uzak yardim (kurumda AnyDesk/Ninja kullaniliyorsa gereksiz)
 )
 # NOT: Kalmasi gerekenler bilerek listede yok ->
 # Photos, Calculator, Store, Terminal, Notepad, Paint, ScreenSketch, WebpImage,
-# VCLibs/UI.Xaml (bagimlilik), SecHealthUI (Defender arayuzu)
+# StickyNotes, Camera (Teams/kamera testi), VCLibs/UI.Xaml (bagimlilik),
+# SecHealthUI (Defender arayuzu), RemoteDesktop (uzak masaustu).
+#
+# Kurumda Teams kullaniliyorsa 'MSTeams' satirini silin; yoksa yeni Teams de kalkar.
 
 #endregion
 
@@ -182,6 +260,16 @@ $ErrorActionPreference = 'Stop'
 $script:LogFile = Join-Path $env:ProgramData "Win11-PostInstall_$(Get-Date -f yyyyMMdd-HHmmss).log"
 $script:Degisen = 0
 $script:Hata    = 0
+$script:Basla   = Get-Date
+
+# Sondaki rapor icin: bolum -> tek satirlik sonuc, ve tum uyari/hatalarin listesi.
+$script:Ozet     = [ordered]@{}
+$script:Uyarilar = New-Object System.Collections.ArrayList
+
+function Add-Ozet {
+    param([string]$Baslik, [string]$Sonuc)
+    $script:Ozet[$Baslik] = $Sonuc
+}
 
 function Write-Log {
     param([string]$Msg, [ValidateSet('INFO','OK','WARN','ERR','SKIP')][string]$Level = 'INFO')
@@ -189,6 +277,8 @@ function Write-Log {
     $color = switch ($Level) { 'OK'{'Green'} 'WARN'{'Yellow'} 'ERR'{'Red'} 'SKIP'{'DarkGray'} default{'Gray'} }
     Write-Host $line -ForegroundColor $color
     try { Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 } catch {}
+    # Sondaki raporda "neye bakmam gerek" listesi olusabilsin diye biriktir.
+    if ($Level -eq 'WARN' -or $Level -eq 'ERR') { [void]$script:Uyarilar.Add("[$Level] $Msg") }
 }
 
 function Write-Baslik {
@@ -313,6 +403,195 @@ function Resolve-Winget {
     return $null
 }
 
+<#
+    Get-ChromeSurum: Chrome kurulu mu? Kuruluysa surum numarasini, degilse $null
+    doner. Boylece her calistirmada ~120 MB MSI bosuna indirilmez.
+
+    Uc yere birden bakilir:
+      1) Makine geneli kurulum (Program Files / Program Files (x86))
+      2) Kayit defteri App Paths (baska bir dizine kurulmus olabilir)
+      3) Kullanici bazli kurulum (her profilin AppData'si) -> SYSTEM baglaminda
+         $env:LOCALAPPDATA SYSTEM profilini gosterdigi icin C:\Users taranir.
+#>
+function Get-ChromeSurum {
+    $adaylar = New-Object System.Collections.ArrayList
+    foreach ($kok in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($kok) { [void]$adaylar.Add((Join-Path $kok 'Google\Chrome\Application\chrome.exe')) }
+    }
+
+    # Kayit defterindeki kayitli yol (varsayilan disi kurulum dizinleri icin)
+    foreach ($rp in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe'
+    )) {
+        try {
+            $v = (Get-ItemProperty -Path $rp -ErrorAction Stop).'(default)'
+            if ($v) { [void]$adaylar.Add($v.Trim('"')) }
+        } catch {}
+    }
+
+    # Kullanici bazli kurulumlar
+    try {
+        Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            [void]$adaylar.Add((Join-Path $_.FullName 'AppData\Local\Google\Chrome\Application\chrome.exe'))
+        }
+    } catch {}
+
+    foreach ($p in $adaylar) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            try   { return (Get-Item -LiteralPath $p).VersionInfo.ProductVersion }
+            catch { return 'bilinmiyor' }
+        }
+    }
+    return $null
+}
+
+<#
+    Get-SurucuEnvanteri: sistemdeki TUM cihazlarin surucu envanterini cikarir.
+    Anahtar = DeviceID (PNP kimligi), deger = surum/tarih/saglayici/donanim ID.
+
+    Guncelleme oncesi ve sonrasi iki kez cagrilip karsilastirilir -> hangi
+    surucunun hangi surumden hangi surume ciktigi net raporlanir.
+#>
+function Get-SurucuEnvanteri {
+    $liste = @{}
+    try {
+        foreach ($d in (Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop)) {
+            if (-not $d.DeviceID -or -not $d.DriverVersion) { continue }
+            $liste[$d.DeviceID] = [pscustomobject]@{
+                Ad        = $d.DeviceName
+                Surum     = $d.DriverVersion
+                Tarih     = $d.DriverDate
+                Saglayici = $d.DriverProviderName
+                DonanimID = $d.HardWareID
+                Sinif     = $d.DeviceClass
+            }
+        }
+    } catch { Write-Log "Surucu envanteri okunamadi: $($_.Exception.Message)" 'WARN' }
+    return $liste
+}
+
+<#
+    Invoke-SurucuGuncelleme: Windows Update Agent (WUA) uzerinden SURUCU
+    guncellemesi yapar.
+
+    Nasil calisir: WUA, makinedeki her cihazin DONANIM KIMLIGINI (hardware ID:
+    orn. PCI\VEN_8086&DEV_9A49&...) sunucuya gonderir; sunucu yalniz o kimlige
+    UYAN ve kurulu olandan DAHA YENI suruculeri dondurur. Yani "surum karsilastirma"
+    isini WU kendisi yapar -> yanlis/uyumsuz surucu kurma riski olmaz.
+
+    TamTarama: Microsoft Update servisini kaydeder ve oradan arar. Onemli, cunku
+    "istege bagli surucu guncellemeleri" (Ayarlar > Windows Update > Gelismis >
+    Istege bagli guncellemeler) yalniz bu servis uzerinden gorunur; normal
+    otomatik guncelleme bunlari HIC indirmez. Kullanicinin istedigi "hep en son
+    surucu" davranisini saglayan kisim budur.
+#>
+function Invoke-SurucuGuncelleme {
+    param([bool]$TamTarama = $true)
+
+    $rapor = [ordered]@{ Bulunan = 0; Kurulan = 0; Basarisiz = 0; YenidenBaslat = $false; Basliklar = @() }
+
+    try { $session = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop }
+    catch {
+        Write-Log "Windows Update servisine baglanilamadi: $($_.Exception.Message)" 'ERR'
+        $script:Hata++; return $rapor
+    }
+
+    $searcher = $session.CreateUpdateSearcher()
+
+    if ($TamTarama) {
+        $msUpdateId = '7971f918-a847-4430-9279-4a52d1efe18d'   # Microsoft Update
+        try {
+            $sm = New-Object -ComObject Microsoft.Update.ServiceManager
+            if (-not ($sm.Services | Where-Object { $_.ServiceID -eq $msUpdateId })) {
+                [void]$sm.AddService2($msUpdateId, 7, '')      # 7 = kayit + online + AU'ya ekle
+                Write-Log "Microsoft Update servisi kaydedildi (istege bagli suruculer icin)" 'OK'
+            }
+            $searcher.ServerSelection = 3    # ssOthers
+            $searcher.ServiceID       = $msUpdateId
+        } catch {
+            Write-Log "Microsoft Update servisi kullanilamadi, varsayilan WU ile devam: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    Write-Host "  -> Donanim kimlikleri Windows Update'e soruluyor (1-3 dk surebilir) ..." -ForegroundColor Gray
+    $sonuc = $null
+    try { $sonuc = $searcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0") }
+    catch {
+        # ServiceID/ServerSelection nedeniyle patladiysa varsayilan servisle tekrar dene
+        Write-Log "Microsoft Update ile surucu taramasi basarisiz, varsayilan WU deneniyor: $($_.Exception.Message)" 'WARN'
+        try { $sonuc = $session.CreateUpdateSearcher().Search("IsInstalled=0 and Type='Driver' and IsHidden=0") }
+        catch {
+            Write-Log "Surucu taramasi basarisiz: $($_.Exception.Message)" 'ERR'
+            $script:Hata++; return $rapor
+        }
+    }
+
+    $rapor.Bulunan = $sonuc.Updates.Count
+    if ($rapor.Bulunan -eq 0) {
+        Write-Log "Tum suruculer guncel - Windows Update'te daha yeni surucu yok" 'OK'
+        return $rapor
+    }
+
+    Write-Log "$($rapor.Bulunan) adet daha yeni surucu bulundu" 'INFO'
+
+    # Kurulu surumlerle karsilastirip ekrana "neyi neyle degistiriyoruz" yaz
+    $envanter = Get-SurucuEnvanteri
+    $col = New-Object -ComObject Microsoft.Update.UpdateColl
+    foreach ($u in $sonuc.Updates) {
+        $hw = ''; $yeniTarih = $null; $saglayici = ''
+        try { $hw = "$($u.DriverHardwareID)"; $yeniTarih = $u.DriverVerDate; $saglayici = "$($u.DriverProvider)" } catch {}
+
+        $mevcut = $null
+        if ($hw) {
+            $mevcut = $envanter.Values | Where-Object {
+                $_.DonanimID -and ("$($_.DonanimID)" -eq $hw)
+            } | Select-Object -First 1
+        }
+
+        $satir = "  + $($u.Title)"
+        if ($saglayici) { $satir += " [$saglayici]" }
+        Write-Log $satir
+        if ($mevcut) {
+            Write-Log ("      kurulu: v{0} ({1:yyyy-MM-dd})  ->  yeni surucu tarihi: {2:yyyy-MM-dd}" -f `
+                        $mevcut.Surum, $mevcut.Tarih, $yeniTarih)
+        }
+
+        if (-not $u.EulaAccepted) { try { $u.AcceptEula() } catch {} }
+        [void]$col.Add($u)
+        $rapor.Basliklar += "$($u.Title)"
+    }
+
+    try {
+        Write-Host "  -> Suruculer indiriliyor ..." -ForegroundColor Gray
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $d = $session.CreateUpdateDownloader(); $d.Updates = $col; [void]$d.Download()
+        Write-Log ("Suruculer indirildi ({0:N1} sn)" -f $sw.Elapsed.TotalSeconds) 'OK'
+
+        Write-Host "  -> Suruculer kuruluyor (cihazlar kisa sure kaybolabilir) ..." -ForegroundColor Gray
+        $sw2 = [Diagnostics.Stopwatch]::StartNew()
+        $i = $session.CreateUpdateInstaller(); $i.Updates = $col
+        $ir = $i.Install()
+        $sw2.Stop()
+        $rapor.YenidenBaslat = [bool]$ir.RebootRequired
+
+        for ($n = 0; $n -lt $col.Count; $n++) {
+            $kod = $ir.GetUpdateResult($n).ResultCode   # 2 = basarili, 3 = uyarili, 4 = hata
+            if ($kod -eq 2 -or $kod -eq 3) { $rapor.Kurulan++;   Write-Log "  OK  $($col.Item($n).Title)" 'OK' }
+            else                           { $rapor.Basarisiz++; Write-Log "  HATA (kod $kod) $($col.Item($n).Title)" 'WARN' }
+        }
+        Write-Log ("Surucu kurulumu bitti: {0} basarili, {1} basarisiz ({2:N1} sn)" -f `
+                    $rapor.Kurulan, $rapor.Basarisiz, $sw2.Elapsed.TotalSeconds) 'OK'
+        if ($rapor.YenidenBaslat) { Write-Log "Suruculerin tam etkili olmasi icin YENIDEN BASLATMA gerekiyor" 'WARN' }
+    }
+    catch {
+        Write-Log "Surucu indirme/kurulum hatasi: $($_.Exception.Message)" 'ERR'
+        $script:Hata++
+    }
+
+    return $rapor
+}
+
 # Cihaz laptop mu? Sasi tipi (ChassisTypes) tasinabilir sinifindaysa ya da
 # batarya varsa laptop kabul edilir.
 function Test-Laptop {
@@ -348,10 +627,10 @@ function Show-BatteryHealth {
         if ($dongu) { Write-Log "Sarj dongusu               : $dongu" }
         Write-Log  "Batarya sagligi            : %$saglik"
 
-        if     ($saglik -ge 80) { Write-Log "YORUM: Batarya saglikli (>=%80). Bir sorun yok." 'OK' }
-        elseif ($saglik -ge 60) { Write-Log "YORUM: Batarya normal yaslanmis (%60-80). Takip edin, aciliyet yok." 'INFO' }
-        elseif ($saglik -ge 40) { Write-Log "YORUM: Batarya yipranmis (%40-60). Sarj suresi belirgin kisalmistir." 'WARN' }
-        else                    { Write-Log "YORUM: Batarya kritik (<%40). Degisim dusunulmeli." 'ERR' }
+        if     ($saglik -ge 80) { Write-Log "YORUM: Batarya saglikli (>=%80). Bir sorun yok." 'OK';   Add-Ozet 'Batarya' "%$saglik - saglikli" }
+        elseif ($saglik -ge 60) { Write-Log "YORUM: Batarya normal yaslanmis (%60-80). Takip edin, aciliyet yok." 'INFO'; Add-Ozet 'Batarya' "%$saglik - normal yaslanma" }
+        elseif ($saglik -ge 40) { Write-Log "YORUM: Batarya yipranmis (%40-60). Sarj suresi belirgin kisalmistir." 'WARN'; Add-Ozet 'Batarya' "%$saglik - YIPRANMIS" }
+        else                    { Write-Log "YORUM: Batarya kritik (<%40). Degisim dusunulmeli." 'ERR';  Add-Ozet 'Batarya' "%$saglik - KRITIK, degisim gerekir" }
     }
     catch { Write-Log "Batarya sagligi okunamadi: $($_.Exception.Message)" 'WARN' }
     finally { Remove-Item $xml -ErrorAction SilentlyContinue }
@@ -366,6 +645,7 @@ function Show-DiskHealth {
         $diskler = Get-PhysicalDisk -ErrorAction Stop
     } catch { Write-Log "Disk bilgisi alinamadi: $($_.Exception.Message)" 'WARN'; return }
 
+    $sorunlu = @()
     foreach ($d in $diskler) {
         $boyutGB = [math]::Round($d.Size / 1GB)
         $tur = $d.MediaType   # SSD / HDD / Unspecified
@@ -374,8 +654,8 @@ function Show-DiskHealth {
         $durum = "$($d.HealthStatus)"   # Healthy / Warning / Unhealthy
         switch ($durum) {
             'Healthy' { Write-Log "  SMART durumu: Healthy" 'OK' }
-            'Warning' { Write-Log "  SMART durumu: Warning -> yedek alin, disk izlenmeli" 'WARN' }
-            default   { Write-Log "  SMART durumu: $durum -> ACIL yedek + degisim" 'ERR' }
+            'Warning' { Write-Log "  SMART durumu: Warning -> yedek alin, disk izlenmeli" 'WARN'; $sorunlu += "$($d.FriendlyName): Warning" }
+            default   { Write-Log "  SMART durumu: $durum -> ACIL yedek + degisim" 'ERR';        $sorunlu += "$($d.FriendlyName): $durum" }
         }
 
         $rc = $d | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
@@ -391,9 +671,13 @@ function Show-DiskHealth {
             }
             if ($rc.ReadErrorsUncorrected -gt 0 -or $rc.WriteErrorsUncorrected -gt 0) {
                 Write-Log ("  Duzeltilemeyen hata: okuma {0}, yazma {1} -> disk yipraniyor" -f $rc.ReadErrorsUncorrected, $rc.WriteErrorsUncorrected) 'WARN'
+                $sorunlu += "$($d.FriendlyName): duzeltilemeyen okuma/yazma hatasi"
             }
         }
     }
+
+    if ($sorunlu.Count -eq 0) { Add-Ozet 'Diskler' "$($diskler.Count) disk - hepsi saglikli" }
+    else                      { Add-Ozet 'Diskler' ("DIKKAT -> " + ($sorunlu -join '; ')) }
 }
 
 #endregion
@@ -450,10 +734,23 @@ Invoke-ForEachUserHive {
     # --- Masaustu ikonlari ---
     # "Bu bilgisayar" ikonu (CLSID). 0=goster, 1=gizle. Hem klasik hem yeni
     # masaustu anahtarina yazilir ki her iki kabuk yolunda da gorunsun.
+    $hideNew    = "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"
+    $hideClasik = "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\ClassicStartMenu"
+
     if ($Config.MasaustuBuBilgisayar) {
         $buPC = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
-        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"  $buPC 0
-        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\ClassicStartMenu" $buPC 0
+        Set-Reg $hideNew    $buPC 0
+        Set-Reg $hideClasik $buPC 0
+    }
+
+    # Denetim Masasi (Kontrol Paneli) ikonu. Win10/11 masaustu ikon ayarlarindaki
+    # CLSID {5399E694-...}; {21EC2020-...} eski kabuk yolunun kullandigi klasik
+    # CLSID. Ikisi de yazilir ki her iki durumda da ikon gorunsun.
+    if ($Config.MasaustuKontrolPaneli) {
+        foreach ($cp in @('{5399E694-6CE5-48C6-8AFE-2A0B9BCF4C7B}', '{21EC2020-3AEA-1069-A2DD-08002B30309D}')) {
+            Set-Reg $hideNew    $cp 0
+            Set-Reg $hideClasik $cp 0
+        }
     }
 
     # --- Baslat menusu ---
@@ -525,6 +822,17 @@ Invoke-ForEachUserHive {
     }
     if ($Config.SaydamlikKapat) {
         Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'EnableTransparency' 0
+    }
+
+    # --- Oyun ozellikleri (per-user) ---
+    # Xbox uygulamasi kaldirilsa bile Oyun Cubugu/Game DVR kabugun icinde durur:
+    # arka planda kayit servisi calisir ve Win+G ile acilir. Burada kapatilir.
+    if ($Config.OyunOzellikleriKapat) {
+        Set-Reg "$U\System\GameConfigStore" 'GameDVR_Enabled' 0
+        Set-Reg "$U\Software\Microsoft\GameBar" 'AutoGameModeEnabled'      0
+        Set-Reg "$U\Software\Microsoft\GameBar" 'ShowStartupPanel'         0
+        Set-Reg "$U\Software\Microsoft\GameBar" 'UseNexusForGameBarEnabled' 0
+        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\GameDVR" 'AppCaptureEnabled' 0
     }
 }
 Write-Log "Per-user ayarlar uygulandi (aktif kullanicilar + Default profil)" 'OK'
@@ -625,6 +933,23 @@ if ($Config.DepoTemizlemeOtomatik) {
     Write-Log "Otomatik depo temizleme (Storage Sense) acildi" 'OK'
 }
 
+if ($Config.OyunOzellikleriKapat) {
+    # Politika ile Game DVR tamamen kapatilir (per-user ayardan bagimsiz, kalici).
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR' 'AllowGameDVR' 0
+
+    # Xbox servisleri: uygulama kaldirilsa bile servisler otomatik baslamaya devam
+    # eder. Ofiste hicbir islevi yok -> devre disi.
+    if (-not $DryRun) {
+        foreach ($svc in @('XblAuthManager','XblGameSave','XboxGipSvc','XboxNetApiSvc')) {
+            try {
+                Stop-Service $svc -Force -ErrorAction SilentlyContinue
+                Set-Service  $svc -StartupType Disabled -ErrorAction Stop
+            } catch { Write-Log "$svc devre disi birakilamadi: $($_.Exception.Message)" 'WARN' }
+        }
+    }
+    Write-Log "Oyun Cubugu / Game DVR ve Xbox servisleri kapatildi" 'OK'
+}
+
 if ($Config.SysMainKapat -and -not $DryRun) {
     # SSD'li sistemlerde SysMain (SuperFetch) bazen gereksiz disk G/C uretir.
     # Varsayilan $false -> yalniz bilinerek acildiginda calisir.
@@ -722,6 +1047,7 @@ if ($Config.BloatwareKaldir) {
         catch { Write-Log "  $app kaldirilamadi: $($_.Exception.Message)" 'WARN' }
     }
     Write-Log "Toplam $kaldirilan paket kaldirildi" 'OK'
+    Add-Ozet 'Bloatware' "$kaldirilan paket kaldirildi"
 }
 
 #endregion
@@ -735,11 +1061,13 @@ if (-not $SkipApps -and $Apps.Count -gt 0) {
     if (-not $winget) {
         Write-Log "winget bulunamadi ve kaydedilemedi. Bu uygulamalar atlandi." 'WARN'
         Write-Log "Cozum: Store'dan 'App Installer' kurup scripti tekrar calistirin." 'INFO'
+        Add-Ozet 'Uygulamalar' 'winget bulunamadi -> hicbiri kurulmadi'
     }
     else {
         Write-Log "winget: $winget" 'INFO'
         & $winget source update --disable-interactivity 2>&1 | Out-Null
 
+        $sayKurulan = 0; $sayAtlanan = 0; $sayHata = 0
         $toplam = $Apps.Count; $sira = 0
         foreach ($id in $Apps) {
             $sira++
@@ -749,7 +1077,7 @@ if (-not $SkipApps -and $Apps.Count -gt 0) {
             # Zaten kurulu mu? Once bunu soyle -> "kuruluyor" derken aslinda kurulu
             # olmasi yanilgisini onler.
             & $winget list --id $id --exact --accept-source-agreements 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-Log "$etiket zaten kurulu, atlandi" 'SKIP'; continue }
+            if ($LASTEXITCODE -eq 0) { Write-Log "$etiket zaten kurulu, atlandi" 'SKIP'; $sayAtlanan++; continue }
 
             $sw = [Diagnostics.Stopwatch]::StartNew()
             Write-Host ("  -> {0} indiriliyor + kuruluyor ..." -f $etiket) -ForegroundColor Gray
@@ -761,10 +1089,11 @@ if (-not $SkipApps -and $Apps.Count -gt 0) {
                             --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
             }
             $sw.Stop(); $sn = "{0:N1} sn" -f $sw.Elapsed.TotalSeconds
-            if ($LASTEXITCODE -eq 0)                              { Write-Log "$etiket kuruldu ($sn)" 'OK' }
-            elseif ("$out" -match 'already installed|zaten')      { Write-Log "$etiket zaten kurulu ($sn)" 'SKIP' }
-            else { Write-Log "$etiket KURULAMADI (exit $LASTEXITCODE, $sn)" 'WARN'; $script:Hata++ }
+            if ($LASTEXITCODE -eq 0)                              { Write-Log "$etiket kuruldu ($sn)" 'OK'; $sayKurulan++ }
+            elseif ("$out" -match 'already installed|zaten')      { Write-Log "$etiket zaten kurulu ($sn)" 'SKIP'; $sayAtlanan++ }
+            else { Write-Log "$etiket KURULAMADI (exit $LASTEXITCODE, $sn)" 'WARN'; $script:Hata++; $sayHata++ }
         }
+        Add-Ozet 'Uygulamalar' "$sayKurulan kuruldu, $sayAtlanan zaten vardi, $sayHata basarisiz"
     }
 }
 
@@ -775,15 +1104,30 @@ if (-not $SkipApps -and $Apps.Count -gt 0) {
 if ($Config_KurChrome -and -not $SkipApps) {
     Write-Baslik "Google Chrome (en son surum)"
 
-    # Once winget dene (varsa hizli ve temiz). Basarisiz olursa resmi MSI'a dus.
+    # 1) ZATEN KURULU MU? Kuruluysa hicbir sey indirilmez. Chrome kendi
+    #    guncelleyicisiyle (GoogleUpdate) zaten en son surume ciktigi icin
+    #    her calistirmada ~120 MB MSI indirmek gereksiz.
+    $mevcutChrome = Get-ChromeSurum
     $kuruldu = $false
-    $wg = Resolve-Winget
+    if ($mevcutChrome -and -not $Config_ChromeZorlaKur) {
+        Write-Log "Chrome zaten kurulu (surum $mevcutChrome) -> indirme/kurulum atlandi" 'SKIP'
+        Write-Log "Yeniden kurmak icin: `$Config_ChromeZorlaKur = `$true" 'INFO'
+        Add-Ozet 'Chrome' "zaten kurulu (v$mevcutChrome) - indirilmedi"
+        $kuruldu = $true
+    }
+    elseif ($mevcutChrome) {
+        Write-Log "Chrome kurulu (v$mevcutChrome) ama zorla kurulum acik -> uzerine kurulacak" 'INFO'
+    }
+
+    # Once winget dene (varsa hizli ve temiz). Basarisiz olursa resmi MSI'a dus.
+    $wg = if ($kuruldu) { $null } else { Resolve-Winget }
     if ($wg -and -not $DryRun) {
         Write-Host "  -> Chrome winget ile deneniyor ..." -ForegroundColor Gray
         $out = & $wg install --id Google.Chrome --exact --silent --scope machine `
                     --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
         if ($LASTEXITCODE -eq 0 -or "$out" -match 'already installed|zaten') {
             Write-Log "Chrome winget ile kuruldu/guncel" 'OK'; $kuruldu = $true
+            Add-Ozet 'Chrome' 'winget ile kuruldu'
         } else {
             Write-Log "winget Chrome'u kuramadi (muhtemelen hash uyusmazligi) -> resmi MSI'a geciliyor" 'WARN'
         }
@@ -795,6 +1139,7 @@ if ($Config_KurChrome -and -not $SkipApps) {
         $msi    = Join-Path $env:TEMP 'chrome_enterprise.msi'
         if ($DryRun) {
             Write-Log "[DRY] Chrome MSI indirilip kurulacak: $msiUrl" 'SKIP'
+            Add-Ozet 'Chrome' '[DRY] kurulacakti'
         } else {
             try {
                 # Indirme ve kurulum AYRI adimlar olarak loglaniyor -> ekranda o an
@@ -811,10 +1156,19 @@ if ($Config_KurChrome -and -not $SkipApps) {
                 $sw2 = [Diagnostics.Stopwatch]::StartNew()
                 $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart')
                 $sw2.Stop()
-                if ($p.ExitCode -eq 0) { Write-Log ("Chrome kuruldu (en son surum, {0:N1} sn)" -f $sw2.Elapsed.TotalSeconds) 'OK' }
-                else { Write-Log "Chrome MSI kurulumu basarisiz (exit $($p.ExitCode))" 'ERR'; $script:Hata++ }
+                if ($p.ExitCode -eq 0) {
+                    Write-Log ("Chrome kuruldu (en son surum, {0:N1} sn)" -f $sw2.Elapsed.TotalSeconds) 'OK'
+                    Add-Ozet 'Chrome' "MSI ile kuruldu (v$(Get-ChromeSurum))"
+                }
+                else {
+                    Write-Log "Chrome MSI kurulumu basarisiz (exit $($p.ExitCode))" 'ERR'; $script:Hata++
+                    Add-Ozet 'Chrome' "KURULAMADI (msiexec exit $($p.ExitCode))"
+                }
             }
-            catch { Write-Log "Chrome kurulamadi: $($_.Exception.Message)" 'ERR'; $script:Hata++ }
+            catch {
+                Write-Log "Chrome kurulamadi: $($_.Exception.Message)" 'ERR'; $script:Hata++
+                Add-Ozet 'Chrome' 'KURULAMADI (indirme/kurulum hatasi)'
+            }
             finally { Remove-Item $msi -ErrorAction SilentlyContinue }
         }
     }
@@ -824,7 +1178,7 @@ if ($Config_KurChrome -and -not $SkipApps) {
     # anahtariyla zorlanamaz. Desteklenen yontem: DefaultAppAssociations XML'i
     # DISM ile ice aktarmak. Bu YENI kullanici profilleri icin gecerlidir
     # (ilk kurulum senaryosunda dogru olan budur). Chrome kurulu olmali (ustte).
-    if ($Config.ChromeVarsayilanTarayici -and -not $DryRun) {
+    if ($Config.ChromeVarsayilanTarayici -and -not $DryRun -and (Get-ChromeSurum)) {
         $xml = Join-Path $env:TEMP 'defaultapps.xml'
         @'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -840,9 +1194,96 @@ if ($Config_KurChrome -and -not $SkipApps) {
             if ($LASTEXITCODE -eq 0) {
                 Write-Log "Chrome varsayilan tarayici yapildi (yeni profiller icin)" 'OK'
                 Write-Log "NOT: Zaten Edge kullanmis mevcut kullanicida Windows secimi koruyabilir" 'INFO'
-            } else { Write-Log "Varsayilan tarayici ayarlanamadi (DISM exit $LASTEXITCODE)" 'WARN' }
+                Add-Ozet 'Varsayilan tarayici' 'Chrome (yeni profiller icin)'
+            } else {
+                Write-Log "Varsayilan tarayici ayarlanamadi (DISM exit $LASTEXITCODE)" 'WARN'
+                Add-Ozet 'Varsayilan tarayici' "ayarlanamadi (DISM exit $LASTEXITCODE)"
+            }
         } catch { Write-Log "Varsayilan tarayici ayarlanamadi: $($_.Exception.Message)" 'WARN' }
         finally { Remove-Item $xml -ErrorAction SilentlyContinue }
+    }
+}
+
+#endregion
+
+#region ==================== SURUCU GUNCELLEME (DONANIM ID) ====================
+
+# Amac: makinedeki TUM suruculer her zaman en son surumde olsun.
+#
+# Yontem: her cihazin DONANIM KIMLIGI (hardware ID) Windows Update'e sorulur,
+# yalniz o kimlige uyan ve KURULU OLANDAN YENI suruculer indirilip kurulur.
+# "Istege bagli surucu guncellemeleri" de dahil edilir (Config.SurucuTamTarama)
+# -> Ayarlar ekranindan elle yapilacak isin tamami otomatiklesir.
+#
+# Bu bolum ON PLANDA calisir (Config.SurucuOnPlanda) cunku sonucun rapora
+# girmesi isteniyor. Windows Update ayni anda iki kurulum kabul etmedigi icin
+# bu bolum, arka plandaki Windows guncellemesi BASLATILMADAN ONCE biter.
+$script:SurucuSonuc = $null
+if ($Config.SuruculeriGuncelle -and $Config.SurucuOnPlanda -and -not $DryRun) {
+    Write-Baslik "Surucu guncelleme (donanim ID'lerine gore)"
+
+    $surucuOncesi = Get-SurucuEnvanteri
+    Write-Log ("Sistemde kayitli surucu sayisi: {0}" -f $surucuOncesi.Count)
+
+    $script:SurucuSonuc = Invoke-SurucuGuncelleme -TamTarama $Config.SurucuTamTarama
+
+    # Gercekten NE degisti? Kurulum sonrasi envanter tekrar okunur ve surumler
+    # karsilastirilir. WU'nun "basarili" demesi bazen surumun degismedigi anlamina
+    # gelir; bu karsilastirma gercegi gosterir.
+    if ($script:SurucuSonuc.Kurulan -gt 0) {
+        $surucuSonrasi = Get-SurucuEnvanteri
+        $degisenler = @()
+        foreach ($id in $surucuSonrasi.Keys) {
+            $yeni = $surucuSonrasi[$id]
+            $eski = $surucuOncesi[$id]
+            if ($eski -and $eski.Surum -ne $yeni.Surum) {
+                $degisenler += ("{0}: v{1} -> v{2}" -f $yeni.Ad, $eski.Surum, $yeni.Surum)
+            }
+        }
+        if ($degisenler.Count -gt 0) {
+            Write-Log "Surumu degisen suruculer:" 'OK'
+            foreach ($d in $degisenler) { Write-Log "  $d" 'OK' }
+            $script:SurucuDegisen = $degisenler
+        } else {
+            Write-Log "Kurulum yapildi ama surum degisimi gorulmedi (yeniden baslatma sonrasi gorunebilir)" 'INFO'
+        }
+    }
+
+    $r = $script:SurucuSonuc
+    if ($r.Bulunan -eq 0) { Add-Ozet 'Suruculer' 'hepsi guncel - yeni surucu yok' }
+    else {
+        $metin = "{0} bulundu, {1} kuruldu, {2} basarisiz" -f $r.Bulunan, $r.Kurulan, $r.Basarisiz
+        if ($r.YenidenBaslat) { $metin += " (yeniden baslatma gerekli)" }
+        Add-Ozet 'Suruculer' $metin
+    }
+}
+elseif ($Config.SuruculeriGuncelle -and $DryRun) {
+    Write-Baslik "Surucu guncelleme (donanim ID'lerine gore)"
+    Write-Log "[DRY] Donanim ID'leri WU'ya sorulup eski suruculer guncellenecekti" 'SKIP'
+}
+
+# Hala eski kalan suruculer: WU'da karsiligi olmayan, ureticiden gelmesi gereken
+# suruculer burada gorunur -> OEM araci / elle mudahale gerekebilir.
+if ($Config.SurucuRaporu -and -not $DryRun) {
+    $esik = (Get-Date).AddYears(-3)
+    $eskiler = @((Get-SurucuEnvanteri).Values |
+        Where-Object {
+            $_.Tarih -and $_.Tarih -lt $esik -and
+            $_.Saglayici -and $_.Saglayici -notmatch 'Microsoft' -and   # Microsoft'un jenerik suruculeri hep eski tarihlidir
+            $_.Sinif -notmatch 'Volume|LegacyDriver|SoftwareDevice|System|PrintQueue'
+        } | Sort-Object Tarih)
+
+    if ($eskiler.Count -gt 0) {
+        Write-Log "3 yildan eski kalan suruculer (WU'da yenisi yok, ureticiden bakilmali):" 'INFO'
+        # Ekran/log sismesin: en eski 12 tanesi yazilir, sayinin tamami ozette.
+        foreach ($e in ($eskiler | Select-Object -First 12)) {
+            Write-Log ("  {0,-45} v{1} ({2:yyyy-MM-dd}) [{3}]" -f `
+                        ($e.Ad -replace '(.{45}).+','$1'), $e.Surum, $e.Tarih, $e.Saglayici)
+        }
+        if ($eskiler.Count -gt 12) { Write-Log ("  ... ve {0} tane daha" -f ($eskiler.Count - 12)) 'INFO' }
+        Add-Ozet 'Eski kalan surucu' ("{0} adet 3 yildan eski (detay logda)" -f $eskiler.Count)
+    } else {
+        Write-Log "3 yildan eski surucu yok" 'OK'
     }
 }
 
@@ -859,7 +1300,9 @@ if (($Config.WindowsUpdate -or $Config.SuruculeriGuncelle) -and -not $DryRun) {
 
     $wuScript = Join-Path $env:ProgramData 'Win11-PostInstall-Update.ps1'
     $wuLog    = Join-Path $env:ProgramData "Win11-Update_$(Get-Date -f yyyyMMdd-HHmmss).log"
-    $suruculerDahil = [bool]$Config.SuruculeriGuncelle
+    # Suruculer on planda halledildiyse arka planda TEKRAR aranmaz: Windows Update
+    # ayni anda iki kurulum yurutmez (0x80240016) ve is bosuna iki kez yapilirdi.
+    $suruculerDahil = [bool]($Config.SuruculeriGuncelle -and -not $Config.SurucuOnPlanda)
 
     # Arka plan surecinin calistiracagi bagimsiz betik. $suruculerDahil degeri
     # buraya gomulur; ana scriptin degiskenlerine erisimi yoktur.
@@ -867,25 +1310,57 @@ if (($Config.WindowsUpdate -or $Config.SuruculeriGuncelle) -and -not $DryRun) {
 `$ErrorActionPreference = 'SilentlyContinue'
 function L(`$m){ "[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'), `$m | Add-Content -Path '$wuLog' -Encoding UTF8 }
 `$suruculerDahil = `$$suruculerDahil
+`$s = `$null
 try {
     L 'Guncelleme araniyor...'
     `$s = New-Object -ComObject Microsoft.Update.Session
     `$sonuc = `$s.CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0')
-    if (`$sonuc.Updates.Count -eq 0) { L 'Sistem guncel, guncelleme yok'; return }
-    `$col = New-Object -ComObject Microsoft.Update.UpdateColl
-    foreach (`$u in `$sonuc.Updates) {
-        `$surucuMu = (`$u.Categories | Where-Object { `$_.Name -match 'Driver|Surucu' }).Count -gt 0
-        if (`$surucuMu -and -not `$suruculerDahil) { continue }
-        if (-not `$u.EulaAccepted) { try { `$u.AcceptEula() } catch {} }
-        [void]`$col.Add(`$u); L ('Sirada: ' + `$u.Title)
+    if (`$sonuc.Updates.Count -eq 0) { L 'Sistem guncel, guncelleme yok' }
+    else {
+        `$col = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach (`$u in `$sonuc.Updates) {
+            `$surucuMu = (`$u.Categories | Where-Object { `$_.Name -match 'Driver|Surucu' }).Count -gt 0
+            if (`$surucuMu -and -not `$suruculerDahil) { continue }
+            if (-not `$u.EulaAccepted) { try { `$u.AcceptEula() } catch {} }
+            [void]`$col.Add(`$u); L ('Sirada: ' + `$u.Title)
+        }
+        if (`$col.Count -eq 0) { L 'Uygulanacak guncelleme yok' }
+        else {
+            L ('' + `$col.Count + ' guncelleme indiriliyor...')
+            `$d = `$s.CreateUpdateDownloader(); `$d.Updates = `$col; [void]`$d.Download()
+            L 'Kuruluyor...'
+            `$i = `$s.CreateUpdateInstaller(); `$i.Updates = `$col; `$ir = `$i.Install()
+            L ('Sonuc kodu: ' + `$ir.ResultCode + '  YenidenBaslatma: ' + `$ir.RebootRequired)
+        }
     }
-    if (`$col.Count -eq 0) { L 'Uygulanacak guncelleme yok'; return }
-    L ('' + `$col.Count + ' guncelleme indiriliyor...')
-    `$d = `$s.CreateUpdateDownloader(); `$d.Updates = `$col; [void]`$d.Download()
-    L 'Kuruluyor...'
-    `$i = `$s.CreateUpdateInstaller(); `$i.Updates = `$col; `$ir = `$i.Install()
-    L ('Sonuc kodu: ' + `$ir.ResultCode + '  YenidenBaslatma: ' + `$ir.RebootRequired)
 } catch { L ('HATA: ' + `$_.Exception.Message) }
+
+# Suruculer arka planda isteniyorsa: donanim ID'lerine gore ayri bir tarama.
+# Istege bagli surucu guncellemeleri yalniz Microsoft Update servisinden gelir.
+if (`$suruculerDahil -and `$s) {
+    try {
+        L 'Surucu taramasi (donanim ID) basliyor...'
+        `$sm = New-Object -ComObject Microsoft.Update.ServiceManager
+        `$msid = '7971f918-a847-4430-9279-4a52d1efe18d'
+        if (-not (`$sm.Services | Where-Object { `$_.ServiceID -eq `$msid })) { [void]`$sm.AddService2(`$msid, 7, '') }
+        `$ds = `$s.CreateUpdateSearcher()
+        `$ds.ServerSelection = 3
+        `$ds.ServiceID = `$msid
+        `$dr = `$ds.Search("IsInstalled=0 and Type='Driver' and IsHidden=0")
+        if (`$dr.Updates.Count -eq 0) { L 'Tum suruculer guncel' }
+        else {
+            `$dcol = New-Object -ComObject Microsoft.Update.UpdateColl
+            foreach (`$u in `$dr.Updates) {
+                if (-not `$u.EulaAccepted) { try { `$u.AcceptEula() } catch {} }
+                [void]`$dcol.Add(`$u); L ('Surucu: ' + `$u.Title)
+            }
+            `$dd = `$s.CreateUpdateDownloader(); `$dd.Updates = `$dcol; [void]`$dd.Download()
+            `$di = `$s.CreateUpdateInstaller(); `$di.Updates = `$dcol; `$dir = `$di.Install()
+            L ('Surucu sonucu: ' + `$dir.ResultCode + '  YenidenBaslatma: ' + `$dir.RebootRequired)
+        }
+    } catch { L ('SURUCU HATASI: ' + `$_.Exception.Message) }
+}
+L 'Bitti.'
 "@
     try {
         Set-Content -Path $wuScript -Value $wuBody -Encoding UTF8
@@ -895,7 +1370,12 @@ try {
         )
         Write-Log "Guncelleme arka planda BASLATILDI (beklenmiyor)" 'OK'
         Write-Log "Ilerleme: $wuLog" 'INFO'
-    } catch { Write-Log "Guncelleme arka plan sureci baslatilamadi: $($_.Exception.Message)" 'WARN' }
+        $script:UpdateLog = $wuLog
+        Add-Ozet 'Windows guncelleme' 'arka planda calisiyor (asagidaki loga bakin)'
+    } catch {
+        Write-Log "Guncelleme arka plan sureci baslatilamadi: $($_.Exception.Message)" 'WARN'
+        Add-Ozet 'Windows guncelleme' 'BASLATILAMADI'
+    }
 }
 elseif ($DryRun) {
     Write-Log "[DRY] Windows/surucu guncellemesi arka planda baslatilacak" 'SKIP'
@@ -927,9 +1407,11 @@ if ($Config.OemSurucuAraci -and -not $SkipApps) {
     $wg = Resolve-Winget
     if (-not $arac) {
         Write-Log "Bu marka icin ozel arac yok; suruculer Windows Update'ten gelir" 'INFO'
+        Add-Ozet 'OEM surucu araci' 'bu marka icin gerekmiyor'
     }
     elseif (-not $wg) {
         Write-Log "winget yok, OEM araci kurulamadi: $arac" 'WARN'
+        Add-Ozet 'OEM surucu araci' "winget yok -> $arac kurulamadi"
     }
     elseif ($DryRun) {
         Write-Log "[DRY] OEM araci kurulacak: $arac" 'SKIP'
@@ -938,20 +1420,76 @@ if ($Config.OemSurucuAraci -and -not $SkipApps) {
         Write-Host "  -> $arac kuruluyor ..." -ForegroundColor Gray
         & $wg install --id $arac --exact --silent --accept-package-agreements `
               --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { Write-Log "OEM araci kuruldu: $arac" 'OK' }
-        else { Write-Log "OEM araci kurulamadi (exit $LASTEXITCODE); elle kurulabilir" 'WARN' }
+        if ($LASTEXITCODE -eq 0) { Write-Log "OEM araci kuruldu: $arac" 'OK'; Add-Ozet 'OEM surucu araci' "$arac kuruldu" }
+        else { Write-Log "OEM araci kurulamadi (exit $LASTEXITCODE); elle kurulabilir" 'WARN'; Add-Ozet 'OEM surucu araci' "$arac KURULAMADI" }
 
-        # Dell: dcu-cli ile suruculeri otomatik tara + uygula (yeniden baslatma yok).
-        if ($marka -match 'Dell') {
-            $dcu = Get-ChildItem "$env:ProgramFiles*\Dell\CommandUpdate\dcu-cli.exe" -ErrorAction SilentlyContinue |
-                   Select-Object -First 1
-            if ($dcu) {
-                Write-Log "Dell Command Update ile suruculer taraniyor + uygulaniyor..."
-                & $dcu.FullName /applyUpdates -reboot=disable 2>&1 | Out-Null
-                Write-Log "Dell surucu guncellemesi tetiklendi (log: dcu-cli)" 'OK'
+        # --- Ureticinin aracini komut satirindan calistir ---
+        # WU her zaman ureticinin en son surucusunu tasimaz (ozellikle BIOS, dok,
+        # tus takimi, guc yonetimi surucusu). OEM araci bu boslugu kapatir.
+        if ($Config.OemSurucuOtoUygula) {
+            switch -Regex ($marka) {
+
+                # Dell Command Update: tam otomatik, sessiz, yeniden baslatmasiz.
+                'Dell' {
+                    $dcu = Get-ChildItem "$env:ProgramFiles*\Dell\CommandUpdate\dcu-cli.exe" -ErrorAction SilentlyContinue |
+                           Select-Object -First 1
+                    if ($dcu) {
+                        Write-Host "  -> Dell Command Update suruculeri uyguluyor ..." -ForegroundColor Gray
+                        & $dcu.FullName /applyUpdates -reboot=disable 2>&1 | Out-Null
+                        Write-Log "Dell surucu guncellemesi calistirildi (exit $LASTEXITCODE)" 'OK'
+                        Add-Ozet 'OEM surucu guncellemesi' 'Dell Command Update calistirildi'
+                    } else { Write-Log "dcu-cli bulunamadi; Dell araci elle calistirilmali" 'WARN' }
+                    break
+                }
+
+                # Lenovo System Update: /CM ile sessiz tarama + kurulum.
+                # -includerebootpackages 1,3,4 -> yeniden baslatma gerektirenler de
+                # kurulur ama -noreboot ile makine kendiliginden kapanmaz.
+                'Lenovo' {
+                    $tvsu = Get-ChildItem "$env:ProgramFiles*\Lenovo\System Update\Tvsu.exe" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1
+                    if ($tvsu) {
+                        Write-Host "  -> Lenovo System Update suruculeri uyguluyor ..." -ForegroundColor Gray
+                        & $tvsu.FullName /CM -search A -action INSTALL -includerebootpackages 1,3,4 -noicon -noreboot 2>&1 | Out-Null
+                        Write-Log "Lenovo surucu guncellemesi calistirildi (exit $LASTEXITCODE)" 'OK'
+                        Add-Ozet 'OEM surucu guncellemesi' 'Lenovo System Update calistirildi'
+                    } else { Write-Log "Tvsu.exe bulunamadi; Lenovo araci elle calistirilmali" 'WARN' }
+                    break
+                }
+
+                # HP: Support Assistant'in sessiz komut satiri yok. Bunun yerine HP'nin
+                # resmi PowerShell kutuphanesi (HPCMSL) ile surucu Softpaq'leri
+                # sessizce kurulur. Kutuphane yoksa/erisim yoksa sadece uyarilir.
+                'HP|Hewlett' {
+                    try {
+                        if (-not (Get-Module -ListAvailable -Name HPCMSL)) {
+                            Write-Host "  -> HP surucu kutuphanesi (HPCMSL) kuruluyor ..." -ForegroundColor Gray
+                            Install-PackageProvider -Name NuGet -Force -Scope AllUsers -ErrorAction Stop | Out-Null
+                            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+                            Install-Module HPCMSL -Force -AcceptLicense -Scope AllUsers -ErrorAction Stop
+                        }
+                        Import-Module HPCMSL -ErrorAction Stop
+                        Write-Host "  -> HP surucu listesi (Softpaq) taraniyor ..." -ForegroundColor Gray
+                        $sp = Get-SoftpaqList -Category Driver -ErrorAction Stop
+                        Write-Log "HP: $($sp.Count) surucu paketi bulundu, kuruluyor..." 'INFO'
+                        $hpOk = 0
+                        foreach ($s in $sp) {
+                            try { Get-Softpaq -Number $s.Id -Action Install -Overwrite yes -ErrorAction Stop | Out-Null; $hpOk++ }
+                            catch { Write-Log "  HP paketi kurulamadi: $($s.Name)" 'WARN' }
+                        }
+                        Write-Log "HP surucu paketi kuruldu: $hpOk/$($sp.Count)" 'OK'
+                        Add-Ozet 'OEM surucu guncellemesi' "HP: $hpOk surucu paketi kuruldu"
+                    }
+                    catch {
+                        Write-Log "HP otomatik surucu guncellemesi yapilamadi: $($_.Exception.Message)" 'WARN'
+                        Write-Log "HP Support Assistant kuruldu -> bir kez elle calistirin" 'INFO'
+                        Add-Ozet 'OEM surucu guncellemesi' 'HP: elle calistirilmali'
+                    }
+                    break
+                }
+
+                default { Write-Log "Bu marka icin otomatik OEM surucu uygulamasi yok" 'INFO' }
             }
-        } else {
-            Write-Log "NOT: HP/Lenovo araci kuruldu; en son suruculeri cekmek icin aracı bir kez calistirin" 'INFO'
         }
     }
 }
@@ -968,13 +1506,109 @@ if (-not $NoRestartExplorer -and -not $DryRun) {
     Write-Log "Explorer yeniden baslatildi" 'OK'
 }
 
-Write-Baslik "Tamamlandi"
-Write-Log "Yazilan registry degeri : $script:Degisen"
-Write-Log "Hata / uyari            : $script:Hata"
-Write-Log "Log dosyasi             : $script:LogFile"
+#region ---------------------- SON RAPOR ----------------------
+
+$sure = (Get-Date) - $script:Basla
+
 Write-Host ""
-Write-Host "Bazi ayarlar (uzun yol destegi, hizli baslatma, telemetri, guncellemeler)" -ForegroundColor Yellow
-Write-Host "icin yeniden baslatma gerekir." -ForegroundColor Yellow
+Write-Host ("#" * 64) -ForegroundColor Green
+Write-Host "  ISLEM TAMAMLANDI - OZET RAPOR" -ForegroundColor Green
+Write-Host ("#" * 64) -ForegroundColor Green
+Write-Host ""
+
+Write-Host ("  Makine        : {0}" -f $env:COMPUTERNAME)
+Write-Host ("  Cihaz tipi    : {0}" -f $(if ($script:Laptop) {'Laptop'} else {'Masaustu'}))
+Write-Host ("  Sure          : {0:N0} dk {1:N0} sn" -f [math]::Floor($sure.TotalMinutes), $sure.Seconds)
+Write-Host ("  Registry yazim: {0} deger" -f $script:Degisen)
+Write-Host ""
+
+if ($script:Ozet.Count -gt 0) {
+    Write-Host "  YAPILANLAR" -ForegroundColor Cyan
+    Write-Host ("  " + ("-" * 60)) -ForegroundColor DarkGray
+    foreach ($k in $script:Ozet.Keys) {
+        $renk = if ("$($script:Ozet[$k])" -match 'KURULAMADI|BASLATILAMADI|DIKKAT|KRITIK|YIPRANMIS|bulunamadi|ayarlanamadi') { 'Yellow' } else { 'Gray' }
+        Write-Host ("  {0,-26}: {1}" -f $k, $script:Ozet[$k]) -ForegroundColor $renk
+    }
+    Write-Host ""
+}
+
+if ($script:SurucuDegisen -and $script:SurucuDegisen.Count -gt 0) {
+    Write-Host "  GUNCELLENEN SURUCULER" -ForegroundColor Cyan
+    Write-Host ("  " + ("-" * 60)) -ForegroundColor DarkGray
+    foreach ($d in ($script:SurucuDegisen | Select-Object -First 15)) { Write-Host "  * $d" -ForegroundColor Green }
+    if ($script:SurucuDegisen.Count -gt 15) {
+        Write-Host ("  ... ve {0} tane daha (tamami log dosyasinda)" -f ($script:SurucuDegisen.Count - 15)) -ForegroundColor DarkGray
+    }
+    Write-Host ""
+}
+
+if ($script:Uyarilar.Count -gt 0) {
+    Write-Host ("  BAKILMASI GEREKENLER ({0} uyari/hata)" -f $script:Uyarilar.Count) -ForegroundColor Yellow
+    Write-Host ("  " + ("-" * 60)) -ForegroundColor DarkGray
+    # Cok uzamasin: ilk 15 tanesi ekranda, tamami log dosyasinda.
+    $goster = $script:Uyarilar | Select-Object -First 15
+    foreach ($u in $goster) { Write-Host "  * $u" -ForegroundColor Yellow }
+    if ($script:Uyarilar.Count -gt 15) {
+        Write-Host ("  ... ve {0} tane daha (tamami log dosyasinda)" -f ($script:Uyarilar.Count - 15)) -ForegroundColor DarkGray
+    }
+    Write-Host ""
+} else {
+    Write-Host "  Uyari/hata yok - her sey temiz." -ForegroundColor Green
+    Write-Host ""
+}
+
+Write-Host "  LOG DOSYALARI" -ForegroundColor Cyan
+Write-Host ("  " + ("-" * 60)) -ForegroundColor DarkGray
+Write-Host ("  Kurulum logu  : {0}" -f $script:LogFile)
+if ($script:UpdateLog) {
+    Write-Host ("  Guncelleme    : {0}" -f $script:UpdateLog)
+    Write-Host "  (Windows guncellemesi ARKA PLANDA devam ediyor;" -ForegroundColor DarkGray
+    Write-Host "   bu pencereyi kapatsaniz da surer.)" -ForegroundColor DarkGray
+}
+if ($script:SurucuSonuc -and $script:SurucuSonuc.YenidenBaslat) {
+    Write-Host ""
+    Write-Host "  ! Kurulan suruculerin devreye girmesi icin yeniden baslatma sart." -ForegroundColor Yellow
+}
+Write-Host ""
+Write-Host "  YENIDEN BASLATMA GEREKIR" -ForegroundColor Yellow
+Write-Host "  Uzun yol destegi, hizli baslatma, telemetri ve guncellemeler" -ForegroundColor Yellow
+Write-Host "  ancak yeniden baslatmadan sonra tam etkili olur." -ForegroundColor Yellow
+Write-Host ""
+Write-Host ("#" * 64) -ForegroundColor Green
+
+# Log dosyasina da ayni ozet yazilsin (sonradan bakildiginda ekran kaybolmus olur)
+try {
+    Add-Content -Path $script:LogFile -Encoding UTF8 -Value @(
+        ""
+        "===================== OZET RAPOR ====================="
+        ("Sure: {0:N1} dk | Registry yazim: {1} | Uyari/hata: {2}" -f $sure.TotalMinutes, $script:Degisen, $script:Uyarilar.Count)
+        ($script:Ozet.Keys | ForEach-Object { "  {0,-26}: {1}" -f $_, $script:Ozet[$_] })
+        ($script:Uyarilar  | ForEach-Object { "  ! $_" })
+    )
+} catch {}
+
+#endregion
+
+#region ---------------------- BEKLEME ----------------------
+# Pencere KENDILIGINDEN KAPANMAZ. Rapor okunabilsin diye kullanici kapatana
+# kadar acik kalir. Otomasyonda (NinjaOne/GPO/Intune -> etkilesimsiz oturum,
+# ya da -NoPause) beklemez; yoksa surec sonsuza kadar asili kalirdi.
+if ($NoPause) {
+    Write-Log "-NoPause verildi -> beklemeden kapaniyor" 'SKIP'
+}
+elseif (-not [Environment]::UserInteractive) {
+    Write-Log "Etkilesimsiz oturum -> beklemeden kapaniyor" 'SKIP'
+}
+else {
+    Write-Host ""
+    Write-Host "  Bu pencere kendiliginden KAPANMAYACAK." -ForegroundColor Cyan
+    Write-Host "  Raporu okuduktan sonra sag ustteki (X) ile kapatabilirsiniz." -ForegroundColor Cyan
+    Write-Host "  Ya da kapatmak icin Enter'a basin." -ForegroundColor DarkGray
+    Write-Host ""
+    try { $null = Read-Host "  Devam etmek icin Enter" } catch { }
+}
+
+#endregion
 
 exit 0
 

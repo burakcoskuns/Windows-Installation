@@ -379,6 +379,39 @@ function Invoke-Step {
     catch { $sw.Stop(); Write-Log ("{0} - HATA ({1:N1} sn): {2}" -f $Ad, $sw.Elapsed.TotalSeconds, $_.Exception.Message) 'ERR'; $script:Hata++ }
 }
 
+<#
+    Invoke-ZamanAsimiyla: verilen isi ayri bir surecte calistirir ve en fazla
+    $Saniye kadar bekler. Bitirirse $true, sure dolarsa $false doner.
+
+    Neden gerekli: Remove-AppxPackage bazi paketlerde (ozellikle Xbox/GamingApp,
+    Teams) AppX dagitim servisi mesgulken DAKIKALARCA geri donmez. Script o
+    sirada donmus gibi gorunur ve kullanici pencereyi kapatir. Boylece en kotu
+    ihtimalle o paket atlanir, script akmaya devam eder.
+#>
+function Invoke-ZamanAsimiyla {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Is,
+        [int]$Saniye = 120,
+        $Arg
+    )
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock $Is -ArgumentList $Arg
+        if (Wait-Job $job -Timeout $Saniye) {
+            Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
+            return $true
+        }
+        # Sure doldu: isi birak, script devam etsin (islem arka planda surebilir)
+        Stop-Job $job -ErrorAction SilentlyContinue
+        return $false
+    }
+    catch {
+        Write-Log "Is calistirilamadi: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+    finally { if ($job) { Remove-Job $job -Force -ErrorAction SilentlyContinue } }
+}
+
 # winget'i her yerde ayni sekilde bulur. Bulamazsa App Installer'i yeniden
 # kaydetmeyi dener ("winget bulunamadi" cogunlukla kayit eksikligindendir,
 # ozellikle SYSTEM baglaminda) ve tekrar arar. Bulursa exe yolunu, bulamazsa
@@ -1026,28 +1059,71 @@ if ($Config.BloatwareKaldir) {
     Write-Log "Provision paketleri taraniyor (bir kez, biraz surebilir)..."
     $tumProv  = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
 
+    # Xbox/oyun paketleri AppX dagitim servisini kilitleyebiliyor: GamingServices
+    # servisleri calisirken Microsoft.GamingApp kaldirmak dakikalarca asili kalir.
+    # Servisleri once durdurunca kaldirma saniyeler icinde biter.
+    if (-not $DryRun -and ($Bloatware -match 'Gaming|Xbox')) {
+        foreach ($svc in @('GamingServices','GamingServicesNet')) {
+            try {
+                if (Get-Service $svc -ErrorAction SilentlyContinue) {
+                    Stop-Service $svc -Force -ErrorAction SilentlyContinue
+                    Write-Log "$svc durduruldu (Xbox paketleri takilmasin diye)" 'INFO'
+                }
+            } catch {}
+        }
+    }
+
     $toplam = $Bloatware.Count; $sayac = 0
+    $askidaKalan = 0
     foreach ($app in $Bloatware) {
         $sayac++
-        Write-Log ("[{0,2}/{1}] {2}" -f $sayac, $toplam, $app)
+        $eslesen = @($tumPaket | Where-Object Name -like "*$app*")
+        $eslesenProv = @($tumProv | Where-Object DisplayName -like "*$app*")
+
+        # Bu kalip hic eslesmiyorsa tek satir yaz ve gec: 75 kalip x bos islem
+        # ekrani doldurmasin, ama atlandigi da gorunsun.
+        if ($eslesen.Count -eq 0 -and $eslesenProv.Count -eq 0) {
+            Write-Log ("[{0,2}/{1}] {2} - yok, atlandi" -f $sayac, $toplam, $app) 'SKIP'
+            continue
+        }
+        Write-Log ("[{0,2}/{1}] {2} ({3} paket)" -f $sayac, $toplam, $app, ($eslesen.Count + $eslesenProv.Count))
+
         try {
-            foreach ($p in ($tumPaket | Where-Object Name -like "*$app*")) {
+            foreach ($p in $eslesen) {
                 if ($DryRun) { Write-Log "  [DRY] Kaldirilacak: $($p.Name)" 'SKIP'; continue }
-                Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction SilentlyContinue
-                Write-Log "  Kaldirildi: $($p.Name)" 'OK'
-                $kaldirilan++
+                # Hangi paketin uzerinde oldugumuz ANINDA gorunsun; asili kalirsa
+                # hangisinde kaldigi belli olsun.
+                Write-Host ("     -> {0} kaldiriliyor ..." -f $p.Name) -ForegroundColor DarkGray
+                $sonuc = Invoke-ZamanAsimiyla -Saniye 120 -Is {
+                    param($pfn)
+                    Remove-AppxPackage -Package $pfn -AllUsers -ErrorAction SilentlyContinue
+                } -Arg $p.PackageFullName
+
+                if ($sonuc) { Write-Log "  Kaldirildi: $($p.Name)" 'OK'; $kaldirilan++ }
+                else {
+                    Write-Log "  $($p.Name) 120 sn'de bitmedi, atlandi (arka planda surebilir)" 'WARN'
+                    $askidaKalan++
+                }
             }
             # Provisioned paket -> yeni kullanicilara bir daha kurulmasin
-            foreach ($pp in ($tumProv | Where-Object DisplayName -like "*$app*")) {
+            foreach ($pp in $eslesenProv) {
                 if ($DryRun) { Write-Log "  [DRY] Provision kaldirilacak: $($pp.DisplayName)" 'SKIP'; continue }
-                Remove-AppxProvisionedPackage -Online -PackageName $pp.PackageName -ErrorAction SilentlyContinue | Out-Null
-                Write-Log "  Provision kaldirildi: $($pp.DisplayName)" 'OK'
+                Write-Host ("     -> {0} (provision) kaldiriliyor ..." -f $pp.DisplayName) -ForegroundColor DarkGray
+                $sonuc = Invoke-ZamanAsimiyla -Saniye 120 -Is {
+                    param($pn)
+                    Remove-AppxProvisionedPackage -Online -PackageName $pn -ErrorAction SilentlyContinue | Out-Null
+                } -Arg $pp.PackageName
+
+                if ($sonuc) { Write-Log "  Provision kaldirildi: $($pp.DisplayName)" 'OK' }
+                else { Write-Log "  $($pp.DisplayName) provision kaldirmasi zaman asimina ugradi" 'WARN'; $askidaKalan++ }
             }
         }
         catch { Write-Log "  $app kaldirilamadi: $($_.Exception.Message)" 'WARN' }
     }
     Write-Log "Toplam $kaldirilan paket kaldirildi" 'OK'
-    Add-Ozet 'Bloatware' "$kaldirilan paket kaldirildi"
+    $ozetMetin = "$kaldirilan paket kaldirildi"
+    if ($askidaKalan -gt 0) { $ozetMetin += ", $askidaKalan tanesi zaman asimina ugradi" }
+    Add-Ozet 'Bloatware' $ozetMetin
 }
 
 #endregion

@@ -98,6 +98,10 @@ $Config = @{
     # --- Donanim sagligi ---
     SaglikRaporu               = $true   # Batarya (laptop) + disk sagligi raporu + yorum
 
+    # --- Denetim / kayit (sirket cihazi) ---
+    USBDosyaDenetimi           = $true   # USB'ye kopyalanan/okunan dosyalari Guvenlik gunlugune yaz (Event 4663)
+    SilmeDenetimiKlasor        = ''       # Bu klasorde silmeler denetlensin (bos=kapali). Orn: 'D:\Ortak'
+
     # --- Temizlik ---
     BloatwareKaldir            = $true
 
@@ -530,10 +534,33 @@ if ($Config.HizliBaslatmaKapat) {
 }
 
 if ($Config.SaatDilimiOtomatik -and -not $DryRun) {
+    # Saat dilimini bolgeden bul + saati NTP'den senkronla.
+    # "Otomatik saat dilimi" (tzautoupdate) cografi konuma dayanir; konum servisi
+    # kapaliysa calismaz. Bu yuzden once bolgeye gore ACIKCA ayarlanir (guvenilir),
+    # sonra otomatik guncelleme de acilir (tasinirsa kendi duzeltsin).
     try {
-        Set-Service tzautoupdate -StartupType Automatic -ErrorAction Stop
-        Write-Log "Otomatik saat dilimi servisi etkinlestirildi" 'OK'
-    } catch { Write-Log "tzautoupdate ayarlanamadi: $($_.Exception.Message)" 'WARN' }
+        # Windows bolge/GeoID -> saat dilimi. Bilinen bolgeler eslenir, digerinde
+        # otomatik tespit + NTP devreye girer.
+        $geoTz = @{ 235 = 'Turkey Standard Time'; 244 = 'Eastern Standard Time' } # 235=Turkiye
+        $geo = try { (Get-WinHomeLocation -ErrorAction Stop).GeoId } catch { $null }
+        if ($geo -and $geoTz.ContainsKey([int]$geo)) {
+            Set-TimeZone -Id $geoTz[[int]$geo] -ErrorAction Stop
+            Write-Log "Saat dilimi bolgeye gore ayarlandi: $($geoTz[[int]$geo])" 'OK'
+        } else {
+            Set-TimeZone -Id 'Turkey Standard Time' -ErrorAction SilentlyContinue
+            Write-Log "Bolge okunamadi -> Turkiye saat dilimi varsayildi" 'INFO'
+        }
+
+        # Konum servisi + otomatik saat dilimi (tasinan cihaz kendini duzeltsin)
+        Set-Service tzautoupdate -StartupType Automatic -ErrorAction SilentlyContinue
+
+        # Saati NTP ile senkronla -> guncel yerel saat
+        Set-Service w32time -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service w32time -ErrorAction SilentlyContinue
+        w32tm.exe /config /manualpeerlist:"time.windows.com,0x9 pool.ntp.org,0x9" /syncfromflags:manual /update 2>&1 | Out-Null
+        w32tm.exe /resync /force 2>&1 | Out-Null
+        Write-Log "Saat NTP ile senkronlandi (guncel yerel saat)" 'OK'
+    } catch { Write-Log "Saat/dilim ayarlanamadi: $($_.Exception.Message)" 'WARN' }
 }
 
 if ($Config.HibernasyonKapat -and -not $DryRun) {
@@ -582,31 +609,80 @@ if ($Config.AramaIndeksiKapat -and -not $DryRun) {
 
 #endregion
 
+#region ==================== DENETIM / KAYIT ====================
+
+# Sirket cihazinda "kim neyi USB'ye kopyaladi / neyi sildi" kaydi.
+# ONEMLI: Bu kayitlar YEREL Guvenlik gunlugune yazilir. Uzun vadeli takip icin
+# NinjaOne (veya bir log toplayici) ile merkezi olarak toplanmalidir; yoksa
+# gunluk dolunca eski kayitlar doner.
+if ($Config.USBDosyaDenetimi -and -not $DryRun) {
+    Write-Baslik "USB dosya denetimi"
+    # "Removable Storage" alt kategorisi tam bu is icin: USB/harici diske her
+    # dosya erisimini otomatik denetler, klasor SACL'i gerekmez.
+    # Sonuc: Guvenlik gunlugu Event ID 4663 (kim, hangi dosya, hangi surec).
+    & auditpol.exe /set /subcategory:"Removable Storage" /success:enable /failure:enable | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Log "USB dosya erisimi denetimi acildi (Guvenlik gunlugu, Event 4663)" 'OK'
+        Write-Log "Uzun vade: kayitlari NinjaOne'a aktarin, yerel gunluk sinirlidir" 'INFO'
+    } else { Write-Log "USB denetimi acilamadi (auditpol exit $LASTEXITCODE)" 'WARN' }
+}
+
+# Silme denetimi bir KLASORE hedeflenir (tum diski denetlemek asiri gurultu uretir).
+if ($Config.SilmeDenetimiKlasor -and -not $DryRun) {
+    if (-not (Test-Path $Config.SilmeDenetimiKlasor)) {
+        Write-Log "Silme denetimi klasoru yok: $($Config.SilmeDenetimiKlasor)" 'WARN'
+    } else {
+        Write-Baslik "Silme denetimi: $($Config.SilmeDenetimiKlasor)"
+        & auditpol.exe /set /subcategory:"File System" /success:enable /failure:enable | Out-Null
+        try {
+            # SACL: Herkes icin silme islemlerini basari olarak denetle (Event 4660/4663)
+            $acl = Get-Acl -Path $Config.SilmeDenetimiKlasor -Audit
+            $kural = New-Object System.Security.AccessControl.FileSystemAuditRule(
+                'Everyone', 'Delete,DeleteSubdirectoriesAndFiles',
+                'ContainerInherit,ObjectInherit', 'None', 'Success')
+            $acl.AddAuditRule($kural)
+            Set-Acl -Path $Config.SilmeDenetimiKlasor -AclObject $acl
+            Write-Log "Silme denetimi kuruldu (Event 4660)" 'OK'
+        } catch { Write-Log "Silme denetimi kurulamadi: $($_.Exception.Message)" 'WARN' }
+    }
+}
+
+#endregion
+
 #region ==================== BLOATWARE ====================
 
 if ($Config.BloatwareKaldir) {
     Write-Baslik "Gereksiz uygulamalarin kaldirilmasi"
     $kaldirilan = 0
 
+    # ONEMLI: Get-AppxPackage -AllUsers ve ozellikle Get-AppxProvisionedPackage
+    # yavas komutlardir (DISM/bilesen deposu taramasi). Eskiden bunlar 34 kalibin
+    # HER BIRI icin ayri cagriliyordu -> ekran dakikalarca "takili" gorunuyordu.
+    # Simdi ikisi de TEK KEZ okunup bellekte filtreleniyor.
+    Write-Log "Yuklu paketler taraniyor (bir kez)..."
+    $tumPaket = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+    Write-Log "Provision paketleri taraniyor (bir kez, biraz surebilir)..."
+    $tumProv  = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+
+    $toplam = $Bloatware.Count; $sayac = 0
     foreach ($app in $Bloatware) {
+        $sayac++
+        Write-Log ("[{0,2}/{1}] {2}" -f $sayac, $toplam, $app)
         try {
-            $paketler = Get-AppxPackage -AllUsers -Name "*$app*" -ErrorAction SilentlyContinue
-            foreach ($p in $paketler) {
-                if ($DryRun) { Write-Log "[DRY] Kaldirilacak: $($p.Name)" 'SKIP'; continue }
+            foreach ($p in ($tumPaket | Where-Object Name -like "*$app*")) {
+                if ($DryRun) { Write-Log "  [DRY] Kaldirilacak: $($p.Name)" 'SKIP'; continue }
                 Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction SilentlyContinue
-                Write-Log "Kaldirildi: $($p.Name)" 'OK'
+                Write-Log "  Kaldirildi: $($p.Name)" 'OK'
                 $kaldirilan++
             }
-
             # Provisioned paket -> yeni kullanicilara bir daha kurulmasin
-            $prov = Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "*$app*"
-            foreach ($pp in $prov) {
-                if ($DryRun) { Write-Log "[DRY] Provision kaldirilacak: $($pp.DisplayName)" 'SKIP'; continue }
+            foreach ($pp in ($tumProv | Where-Object DisplayName -like "*$app*")) {
+                if ($DryRun) { Write-Log "  [DRY] Provision kaldirilacak: $($pp.DisplayName)" 'SKIP'; continue }
                 Remove-AppxProvisionedPackage -Online -PackageName $pp.PackageName -ErrorAction SilentlyContinue | Out-Null
-                Write-Log "Provision kaldirildi: $($pp.DisplayName)" 'OK'
+                Write-Log "  Provision kaldirildi: $($pp.DisplayName)" 'OK'
             }
         }
-        catch { Write-Log "$app kaldirilamadi: $($_.Exception.Message)" 'WARN' }
+        catch { Write-Log "  $app kaldirilamadi: $($_.Exception.Message)" 'WARN' }
     }
     Write-Log "Toplam $kaldirilan paket kaldirildi" 'OK'
 }
@@ -706,57 +782,55 @@ if ($Config_KurChrome -and -not $SkipApps) {
 
 #region ==================== WINDOWS + SURUCU GUNCELLEME ====================
 
-# Windows Update Agent COM API ile calisir — harici modul (PSWindowsUpdate)
-# gerektirmez, SYSTEM baglaminda da guvenilirdir. Surucu guncellemeleri de
-# Windows Update uzerinden geldigi icin ayni aramada yakalanir.
-function Invoke-WindowsUpdate {
-    param([switch]$SuruculerDahil)
-    try {
-        $session  = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-
-        Write-Log "Guncellemeler araniyor (bu birkac dakika surebilir)..."
-        # IsInstalled=0: kurulu olmayanlar. Surucular da bu sonuclara dahildir.
-        $sonuc = $searcher.Search("IsInstalled=0 and IsHidden=0")
-        if ($sonuc.Updates.Count -eq 0) { Write-Log "Sistem guncel, yeni guncelleme yok" 'OK'; return }
-
-        $indirilecek = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($u in $sonuc.Updates) {
-            $surucuMu = ($u.Categories | Where-Object { $_.Name -match 'Driver|Surucu' }).Count -gt 0
-            if ($surucuMu -and -not $SuruculerDahil) { continue }
-            # EULA'yi otomatik kabul et, yoksa indirme atlanir
-            if (-not $u.EulaAccepted) { try { $u.AcceptEula() } catch {} }
-            [void]$indirilecek.Add($u)
-            Write-Log "Sirada: $($u.Title)"
-        }
-        if ($indirilecek.Count -eq 0) { Write-Log "Uygulanacak guncelleme yok" 'OK'; return }
-
-        Write-Log "$($indirilecek.Count) guncelleme indiriliyor..."
-        $downloader = $session.CreateUpdateDownloader()
-        $downloader.Updates = $indirilecek
-        [void]$downloader.Download()
-
-        $installer = $session.CreateUpdateInstaller()
-        $installer.Updates = $indirilecek
-        Write-Log "Kuruluyor..."
-        $ir = $installer.Install()
-
-        $rc = switch ($ir.ResultCode) { 2 {'Basarili'} 3 {'Basarili (uyarilarla)'} 4 {'Basarisiz'} default {"Kod $($ir.ResultCode)"} }
-        Write-Log "Guncelleme sonucu: $rc" $(if ($ir.ResultCode -eq 2) {'OK'} else {'WARN'})
-        if ($ir.RebootRequired) { Write-Log "!! Guncellemeler icin YENIDEN BASLATMA gerekiyor" 'WARN' }
-    }
-    catch {
-        Write-Log "Windows Update calistirilamadi: $($_.Exception.Message)" 'ERR'
-        $script:Hata++
-    }
-}
-
+# ARKA PLANDA calisir: guncelleme uzun surdugu icin script BEKLEMEZ. Guncelleme
+# mantigi ayri bir gizli PowerShell surecine yazilir ve baslatilir; bu surec ana
+# script kapansa da devam eder. Windows Update Agent COM API kullanir (harici
+# modul yok, SYSTEM baglaminda guvenilir). Surucu guncellemeleri de WU'dan gelir.
 if (($Config.WindowsUpdate -or $Config.SuruculeriGuncelle) -and -not $DryRun) {
-    Write-Baslik "Windows ve surucu guncellemeleri"
-    Invoke-WindowsUpdate -SuruculerDahil:$Config.SuruculeriGuncelle
+    Write-Baslik "Windows ve surucu guncellemeleri (arka planda)"
+
+    $wuScript = Join-Path $env:ProgramData 'Win11-PostInstall-Update.ps1'
+    $wuLog    = Join-Path $env:ProgramData "Win11-Update_$(Get-Date -f yyyyMMdd-HHmmss).log"
+    $suruculerDahil = [bool]$Config.SuruculeriGuncelle
+
+    # Arka plan surecinin calistiracagi bagimsiz betik. $suruculerDahil degeri
+    # buraya gomulur; ana scriptin degiskenlerine erisimi yoktur.
+    $wuBody = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+function L(`$m){ "[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'), `$m | Add-Content -Path '$wuLog' -Encoding UTF8 }
+`$suruculerDahil = `$$suruculerDahil
+try {
+    L 'Guncelleme araniyor...'
+    `$s = New-Object -ComObject Microsoft.Update.Session
+    `$sonuc = `$s.CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0')
+    if (`$sonuc.Updates.Count -eq 0) { L 'Sistem guncel, guncelleme yok'; return }
+    `$col = New-Object -ComObject Microsoft.Update.UpdateColl
+    foreach (`$u in `$sonuc.Updates) {
+        `$surucuMu = (`$u.Categories | Where-Object { `$_.Name -match 'Driver|Surucu' }).Count -gt 0
+        if (`$surucuMu -and -not `$suruculerDahil) { continue }
+        if (-not `$u.EulaAccepted) { try { `$u.AcceptEula() } catch {} }
+        [void]`$col.Add(`$u); L ('Sirada: ' + `$u.Title)
+    }
+    if (`$col.Count -eq 0) { L 'Uygulanacak guncelleme yok'; return }
+    L ('' + `$col.Count + ' guncelleme indiriliyor...')
+    `$d = `$s.CreateUpdateDownloader(); `$d.Updates = `$col; [void]`$d.Download()
+    L 'Kuruluyor...'
+    `$i = `$s.CreateUpdateInstaller(); `$i.Updates = `$col; `$ir = `$i.Install()
+    L ('Sonuc kodu: ' + `$ir.ResultCode + '  YenidenBaslatma: ' + `$ir.RebootRequired)
+} catch { L ('HATA: ' + `$_.Exception.Message) }
+"@
+    try {
+        Set-Content -Path $wuScript -Value $wuBody -Encoding UTF8
+        # -Wait YOK -> fire-and-forget. Ayri surec, ana script kapansa da surer.
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$wuScript`""
+        )
+        Write-Log "Guncelleme arka planda BASLATILDI (beklenmiyor)" 'OK'
+        Write-Log "Ilerleme: $wuLog" 'INFO'
+    } catch { Write-Log "Guncelleme arka plan sureci baslatilamadi: $($_.Exception.Message)" 'WARN' }
 }
 elseif ($DryRun) {
-    Write-Log "[DRY] Windows/surucu guncellemeleri calistirilacak" 'SKIP'
+    Write-Log "[DRY] Windows/surucu guncellemesi arka planda baslatilacak" 'SKIP'
 }
 
 #endregion

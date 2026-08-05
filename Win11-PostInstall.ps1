@@ -40,7 +40,7 @@ param(
 
 $Config = @{
     # --- Taskbar / Gorev cubugu ---
-    TaskbarSolaHizala          = $true   # Ikonlari sola al (Win10 gibi)
+    TaskbarSolaHizala          = $false  # $true: sola al (Win10 gibi) · $false: ortada birak (Win11 varsayilan)
     AramaKutusunuKaldir        = $true   # Baslat yanindaki arama kutusunu tamamen gizle
     GorevGorunumunuKaldir      = $true   # Task View butonu
     WidgetlariKaldir           = $true   # Hava durumu / haberler widget'i
@@ -48,6 +48,9 @@ $Config = @{
     CopilotKaldir              = $true   # Copilot butonu + politika
     SaniyeGoster               = $false  # Saatte saniyeyi goster
     SagTikEndTask              = $true   # Taskbar sag tik menusune "End task" ekle
+
+    # --- Masaustu ---
+    MasaustuBuBilgisayar       = $true   # "Bu bilgisayar" ikonunu masaustune ekle
 
     # --- Baslat menusu ---
     StartWebAramaKapat         = $true   # Bing / web sonuclarini kapat
@@ -80,11 +83,19 @@ $Config = @{
 
     # --- Temizlik ---
     BloatwareKaldir            = $true
+
+    # --- Guncelleme (kurulum sonunda calisir, uzun surebilir) ---
+    WindowsUpdate              = $true   # Eksik Windows guncellemelerini indir + kur
+    SuruculeriGuncelle         = $true   # Windows Update uzerinden surucu guncellemeleri
 }
+
+# Chrome ayri kuruluyor (asagidaki KurChrome) — winget'in Chrome paketi Google
+# installer'i ayni URL'de guncelledigi icin sik sik "hash uyusmuyor" hatasi verir.
+# Resmi Enterprise MSI her zaman en son surumu makine geneli kurar.
+$Config_KurChrome = $true
 
 # winget ile kurulacak uygulamalar (winget id)
 $Apps = @(
-    'Google.Chrome'
     '7zip.7zip'
     'Notepad++.Notepad++'
     'VideoLAN.VLC'
@@ -171,7 +182,13 @@ $kimlik = [Security.Principal.WindowsIdentity]::GetCurrent()
 $yonetici = ([Security.Principal.WindowsPrincipal]$kimlik).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $yonetici) {
     Write-Host "Yonetici hakki gerekiyor, yeniden baslatiliyor..." -ForegroundColor Yellow
-    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $MyInvocation.UnboundArguments
+    # Switch parametreleri $PSBoundParameters'tan yeniden kurulur. UnboundArguments
+    # bunlari icermez (tanimli olduklari icin bound olurlar) -> yukseltme sonrasi
+    # -DryRun/-SkipApps sessizce dusup istenmeyen degisiklik yapilirdi.
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+    foreach ($k in $PSBoundParameters.Keys) {
+        if ($PSBoundParameters[$k] -is [switch] -and $PSBoundParameters[$k]) { $argList += "-$k" }
+    }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
     exit
 }
@@ -259,7 +276,9 @@ Invoke-ForEachUserHive {
     $PolExp   = "$U\Software\Policies\Microsoft\Windows\Explorer"
 
     # --- Taskbar ---
-    if ($Config.TaskbarSolaHizala)   { Set-Reg $Adv 'TaskbarAl' 0 }
+    # Hiza her zaman yazilir (0=sol, 1=orta): onceki calistirmada sola alinmissa
+    # $false yapilinca geri ortalanabilsin. Sadece atlamak eski degeri birakirdi.
+    Set-Reg $Adv 'TaskbarAl' $(if ($Config.TaskbarSolaHizala) { 0 } else { 1 })
     if ($Config.AramaKutusunuKaldir) { Set-Reg $Search 'SearchboxTaskbarMode' 0 }   # 0=gizli 1=ikon 2=kutu
     if ($Config.GorevGorunumunuKaldir) { Set-Reg $Adv 'ShowTaskViewButton' 0 }
     if ($Config.WidgetlariKaldir)    { Set-Reg $Adv 'TaskbarDa' 0 }
@@ -270,6 +289,15 @@ Invoke-ForEachUserHive {
     }
     if ($Config.SaniyeGoster)        { Set-Reg $Adv 'ShowSecondsInSystemClock' 1 }
     if ($Config.SagTikEndTask)       { Set-Reg "$Adv\TaskbarDeveloperSettings" 'TaskbarEndTask' 1 }
+
+    # --- Masaustu ikonlari ---
+    # "Bu bilgisayar" ikonu (CLSID). 0=goster, 1=gizle. Hem klasik hem yeni
+    # masaustu anahtarina yazilir ki her iki kabuk yolunda da gorunsun.
+    if ($Config.MasaustuBuBilgisayar) {
+        $buPC = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
+        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"  $buPC 0
+        Set-Reg "$U\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\ClassicStartMenu" $buPC 0
+    }
 
     # --- Baslat menusu ---
     if ($Config.StartWebAramaKapat) {
@@ -469,6 +497,108 @@ if (-not $SkipApps -and $Apps.Count -gt 0) {
 
 #endregion
 
+#region ==================== CHROME (EN SON SURUM) ====================
+
+if ($Config_KurChrome -and -not $SkipApps) {
+    Write-Baslik "Google Chrome (en son surum)"
+
+    # Once winget dene (varsa hizli ve temiz). Basarisiz olursa resmi MSI'a dus.
+    $kuruldu = $false
+    $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($wg -and -not $DryRun) {
+        $out = & $wg.Source install --id Google.Chrome --exact --silent --scope machine `
+                    --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+        if ($LASTEXITCODE -eq 0 -or "$out" -match 'already installed|zaten') {
+            Write-Log "Chrome winget ile kuruldu/guncel" 'OK'; $kuruldu = $true
+        } else {
+            Write-Log "winget Chrome'u kuramadi (muhtemelen hash uyusmazligi), MSI'a geciliyor" 'WARN'
+        }
+    }
+
+    # Resmi Enterprise MSI — her zaman en son surum, makine geneli, sessiz.
+    if (-not $kuruldu) {
+        $msiUrl = 'https://dl.google.com/tag/s/dl/chrome/install/googlechromestandaloneenterprise64.msi'
+        $msi    = Join-Path $env:TEMP 'chrome_enterprise.msi'
+        if ($DryRun) {
+            Write-Log "[DRY] Chrome MSI indirilip kurulacak: $msiUrl" 'SKIP'
+        } else {
+            try {
+                Write-Log "Chrome MSI indiriliyor..."
+                $eskiPB = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+                Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
+                $ProgressPreference = $eskiPB
+
+                $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+                    '/i', "`"$msi`"", '/qn', '/norestart'
+                )
+                if ($p.ExitCode -eq 0) { Write-Log "Chrome kuruldu (Enterprise MSI, en son surum)" 'OK' }
+                else { Write-Log "Chrome MSI kurulumu basarisiz (exit $($p.ExitCode))" 'ERR'; $script:Hata++ }
+            }
+            catch { Write-Log "Chrome kurulamadi: $($_.Exception.Message)" 'ERR'; $script:Hata++ }
+            finally { Remove-Item $msi -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+#endregion
+
+#region ==================== WINDOWS + SURUCU GUNCELLEME ====================
+
+# Windows Update Agent COM API ile calisir — harici modul (PSWindowsUpdate)
+# gerektirmez, SYSTEM baglaminda da guvenilirdir. Surucu guncellemeleri de
+# Windows Update uzerinden geldigi icin ayni aramada yakalanir.
+function Invoke-WindowsUpdate {
+    param([switch]$SuruculerDahil)
+    try {
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+
+        Write-Log "Guncellemeler araniyor (bu birkac dakika surebilir)..."
+        # IsInstalled=0: kurulu olmayanlar. Surucular da bu sonuclara dahildir.
+        $sonuc = $searcher.Search("IsInstalled=0 and IsHidden=0")
+        if ($sonuc.Updates.Count -eq 0) { Write-Log "Sistem guncel, yeni guncelleme yok" 'OK'; return }
+
+        $indirilecek = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($u in $sonuc.Updates) {
+            $surucuMu = ($u.Categories | Where-Object { $_.Name -match 'Driver|Surucu' }).Count -gt 0
+            if ($surucuMu -and -not $SuruculerDahil) { continue }
+            # EULA'yi otomatik kabul et, yoksa indirme atlanir
+            if (-not $u.EulaAccepted) { try { $u.AcceptEula() } catch {} }
+            [void]$indirilecek.Add($u)
+            Write-Log "Sirada: $($u.Title)"
+        }
+        if ($indirilecek.Count -eq 0) { Write-Log "Uygulanacak guncelleme yok" 'OK'; return }
+
+        Write-Log "$($indirilecek.Count) guncelleme indiriliyor..."
+        $downloader = $session.CreateUpdateDownloader()
+        $downloader.Updates = $indirilecek
+        [void]$downloader.Download()
+
+        $installer = $session.CreateUpdateInstaller()
+        $installer.Updates = $indirilecek
+        Write-Log "Kuruluyor..."
+        $ir = $installer.Install()
+
+        $rc = switch ($ir.ResultCode) { 2 {'Basarili'} 3 {'Basarili (uyarilarla)'} 4 {'Basarisiz'} default {"Kod $($ir.ResultCode)"} }
+        Write-Log "Guncelleme sonucu: $rc" $(if ($ir.ResultCode -eq 2) {'OK'} else {'WARN'})
+        if ($ir.RebootRequired) { Write-Log "!! Guncellemeler icin YENIDEN BASLATMA gerekiyor" 'WARN' }
+    }
+    catch {
+        Write-Log "Windows Update calistirilamadi: $($_.Exception.Message)" 'ERR'
+        $script:Hata++
+    }
+}
+
+if (($Config.WindowsUpdate -or $Config.SuruculeriGuncelle) -and -not $DryRun) {
+    Write-Baslik "Windows ve surucu guncellemeleri"
+    Invoke-WindowsUpdate -SuruculerDahil:$Config.SuruculeriGuncelle
+}
+elseif ($DryRun) {
+    Write-Log "[DRY] Windows/surucu guncellemeleri calistirilacak" 'SKIP'
+}
+
+#endregion
+
 #region ==================== BITIS ====================
 
 if (-not $NoRestartExplorer -and -not $DryRun) {
@@ -484,7 +614,8 @@ Write-Log "Yazilan registry degeri : $script:Degisen"
 Write-Log "Hata / uyari            : $script:Hata"
 Write-Log "Log dosyasi             : $script:LogFile"
 Write-Host ""
-Write-Host "Bazi ayarlar (uzun yol destegi, hizli baslatma, telemetri) icin yeniden baslatma gerekir." -ForegroundColor Yellow
+Write-Host "Bazi ayarlar (uzun yol destegi, hizli baslatma, telemetri, guncellemeler)" -ForegroundColor Yellow
+Write-Host "icin yeniden baslatma gerekir." -ForegroundColor Yellow
 
 exit 0
 

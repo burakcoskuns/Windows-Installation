@@ -45,12 +45,15 @@
     bitince cikarilir. Icerideki sources\setupprep.exe /product server calisir.
 
 .PARAMETER IsoIndir
-    ISO'yu Microsoft'un sunucusundan indirmek icin hedef klasor (orn: C:\ISO).
-    Klasorde 3 GB'tan buyuk bir ISO zaten varsa tekrar indirilmez. Indirme
-    basarisiz olursa elle indirme yonergesi yazilir. -SetupBaslat verilmediyse
-    indirilen ISO otomatik kullanilir.
+    ISO'yu Microsoft'un sunucusundan indirir. Varsayilan hedef C:\Temp; klasor
+    yoksa olusturulur. Orada 3 GB'tan buyuk bir ISO zaten varsa TEKRAR
+    INDIRILMEZ, mevcut dosya kullanilir. Indirme basarisiz olursa elle indirme
+    yonergesi yazilir. -SetupBaslat verilmediyse indirilen ISO otomatik kullanilir.
     FILO NOTU: her makineye 5-6 GB indirmek yerine bir kez indirip ag payina
     koyun; -SetupBaslat \\sunucu\pay\Win11.iso cok daha hizli ve guvenilirdir.
+
+.PARAMETER IsoKlasor
+    ISO'nun inecegi klasor (varsayilan: C:\Temp). Yoksa olusturulur.
 
 .PARAMETER IsoDil
     Indirilecek ISO'nun dili (varsayilan: Turkish). Orn: 'English (United States)'.
@@ -74,7 +77,8 @@
     .\Win11-UyumsuzDonanim.ps1                      # sadece rapor
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme    # anahtarlari yaz, kurulumu elle baslat
     .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso
-    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir C:\ISO   # ISO yoksa indirsin
+    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir           # C:\Temp'e indirip kurar
+    .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir -IsoKlasor D:\ISO -Sessiz
     .\Win11-UyumsuzDonanim.ps1 -UsbHazirla E:       # kurulum USB'sini hazirla
     X:\...\Win11-UyumsuzDonanim.ps1 -WinPE          # setup ekraninda Shift+F10
 
@@ -90,7 +94,8 @@
 param(
     [switch]$YerindeYukseltme,
     [string]$SetupBaslat,
-    [string]$IsoIndir,
+    [switch]$IsoIndir,
+    [string]$IsoKlasor = "$env:SystemDrive\Temp",
     [string]$IsoDil = 'Turkish',
     [switch]$Sessiz,
     [string]$UsbHazirla,
@@ -315,8 +320,22 @@ function Get-Win11Iso {
 
     if (-not (Test-Path $Hedef)) {
         if ($DryRun) { Yaz "[DRY] Klasor olusturulacak: $Hedef" 'SKIP' }
-        else { New-Item -ItemType Directory -Path $Hedef -Force | Out-Null }
+        else {
+            New-Item -ItemType Directory -Path $Hedef -Force | Out-Null
+            Yaz "Klasor olusturuldu: $Hedef" 'OK'
+        }
     }
+
+    # ISO 5-6 GB; yer yoksa yarida kalir. Onceden bakip net soyleyelim.
+    try {
+        $surucu = (Split-Path -Qualifier (Resolve-Path $Hedef -ErrorAction SilentlyContinue)) -replace ':',''
+        if ($surucu) {
+            $bosGB = [math]::Round((Get-PSDrive -Name $surucu -ErrorAction Stop).Free / 1GB, 1)
+            if ($bosGB -lt 10) {
+                Yaz "$surucu`: surucusunde sadece $bosGB GB bos yer var; ISO icin 8-10 GB gerekir." 'WARN'
+            } else { Yaz "Bos disk alani: $bosGB GB" 'INFO' }
+        }
+    } catch {}
 
     # Zaten indirilmis mi? Chrome'da oldugu gibi: varsa tekrar indirme.
     $mevcut = Get-ChildItem -LiteralPath $Hedef -Filter '*.iso' -ErrorAction SilentlyContinue |
@@ -656,8 +675,8 @@ if ($YerindeYukseltme) {
 }
 
 if ($IsoIndir) {
-    Baslik "Windows 11 ISO indiriliyor"
-    $indirilen = Get-Win11Iso -Hedef $IsoIndir -Dil $IsoDil
+    Baslik "Windows 11 ISO indiriliyor -> $IsoKlasor"
+    $indirilen = Get-Win11Iso -Hedef $IsoKlasor -Dil $IsoDil
     if ($indirilen) {
         # Ayrica -SetupBaslat verilmediyse indirilen ISO dogrudan kullanilir
         if (-not $SetupBaslat) { $SetupBaslat = $indirilen }
@@ -676,6 +695,14 @@ if ($SetupBaslat) {
     }
     Start-SetupPrep -Kaynak $SetupBaslat -Sessiz:$Sessiz
     $islemYapildi = $true
+
+    # Indirilen ISO diskte kaliyor: bilerek silmiyoruz (kurulum yarim kalirsa
+    # tekrar indirmek gerekmesin). Yer sikintisi olursa kullanici silsin.
+    if ($indirilen) {
+        Write-Host ""
+        Yaz "ISO burada duruyor: $indirilen" 'INFO'
+        Yaz "Yukseltme bittiyse silip 5-6 GB yer acabilirsiniz." 'INFO'
+    }
 }
 elseif ($Sessiz) {
     Yaz "-Sessiz tek basina bir sey yapmaz; -SetupBaslat <ISO> ile birlikte kullanin." 'WARN'
@@ -720,8 +747,9 @@ if (-not $islemYapildi) {
     Write-Host "  teklif etmez - sadece aylik guncellemeler gelir. Yeni build icin ISO sart." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  0) ISO yoksa script kendisi indirsin:" -ForegroundColor White
-    Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir C:\ISO" -ForegroundColor Gray
-    Write-Host "       indirir + anahtarlari yazar + kurulumu baslatir (tek komut)" -ForegroundColor DarkGray
+    Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -IsoIndir" -ForegroundColor Gray
+    Write-Host "       C:\Temp'e iner (klasor yoksa acilir), anahtarlari yazar, kurulumu baslatir" -ForegroundColor DarkGray
+    Write-Host "       baska klasor icin: -IsoKlasor D:\ISO" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  1) Mevcut Windows'u yukseltmek (dosyalar/programlar kalsin):" -ForegroundColor White
     Write-Host "       .\Win11-UyumsuzDonanim.ps1 -YerindeYukseltme -SetupBaslat C:\Win11_24H2.iso" -ForegroundColor Gray
